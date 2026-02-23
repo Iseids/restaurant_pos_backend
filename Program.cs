@@ -263,6 +263,36 @@ app.MapPost("/api/orders", async (HttpContext ctx, HttpRequest req, OrdersServic
     }
 });
 
+app.MapPost("/api/orders/merge", async (HttpContext ctx, HttpRequest req, OrdersService orders, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Service, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var payload = await ReadJsonMap(req, ct);
+    var orderIds = ParseGuidList(payload.TryGetValue("orderIds", out var idsEl) ? idsEl : default);
+    var targetOrderId = GetGuid(payload, "targetOrderId");
+
+    try
+    {
+        var result = await orders.MergeOrders(orderIds, targetOrderId, ct);
+        return ApiResults.Ok(new { result = result.ToJson() });
+    }
+    catch (PosNotFoundException)
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "NOT_FOUND", "One or more orders not found");
+    }
+    catch (PosRuleException ex) when (ex.Code == "ORDER_LOCKED")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ORDER_LOCKED", "One or more orders are already paid/closed");
+    }
+    catch (PosRuleException ex) when (ex.Code is "MERGE_MIN_2" or "MERGE_TARGET_INVALID")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, ex.Code, "Invalid merge request");
+    }
+});
+
 app.MapGet("/api/orders/{id:guid}", async (HttpContext ctx, Guid id, OrdersService orders, CancellationToken ct) =>
 {
     if (ctx.RequireMinRole(PosRole.Service, out _) is { } denied)

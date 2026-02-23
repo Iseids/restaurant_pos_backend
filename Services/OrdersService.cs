@@ -937,6 +937,103 @@ public sealed class OrdersService(PosDbContext db)
         await db.SaveChangesAsync(ct);
     }
 
+    public async Task<MergeOrdersResult> MergeOrders(
+        IReadOnlyList<Guid> orderIds,
+        Guid? targetOrderId,
+        CancellationToken ct)
+    {
+        var uniqueIds = orderIds
+            .Where(x => x != Guid.Empty)
+            .Distinct()
+            .ToList();
+
+        if (uniqueIds.Count < 2)
+        {
+            throw new PosRuleException("MERGE_MIN_2");
+        }
+
+        var targetId = targetOrderId ?? uniqueIds[0];
+        if (!uniqueIds.Contains(targetId))
+        {
+            throw new PosRuleException("MERGE_TARGET_INVALID");
+        }
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        var orders = await db.Orders
+            .Where(x => uniqueIds.Contains(x.Id))
+            .ToListAsync(ct);
+
+        if (orders.Count != uniqueIds.Count)
+        {
+            throw new PosNotFoundException("ORDER_NOT_FOUND");
+        }
+
+        if (orders.Any(x => x.Status != "open"))
+        {
+            throw new PosRuleException("ORDER_LOCKED");
+        }
+
+        var target = orders.FirstOrDefault(x => x.Id == targetId);
+        if (target is null)
+        {
+            throw new PosRuleException("MERGE_TARGET_INVALID");
+        }
+
+        var sourceIds = uniqueIds
+            .Where(x => x != targetId)
+            .ToList();
+
+        if (sourceIds.Count == 0)
+        {
+            throw new PosRuleException("MERGE_MIN_2");
+        }
+
+        var sourceSet = sourceIds.ToHashSet();
+
+        var sourceItems = await db.OrderItems
+            .Where(x => sourceSet.Contains(x.OrderId))
+            .ToListAsync(ct);
+        foreach (var item in sourceItems)
+        {
+            item.OrderId = targetId;
+        }
+
+        var sourcePayments = await db.Payments
+            .Where(x => sourceSet.Contains(x.OrderId))
+            .ToListAsync(ct);
+        foreach (var payment in sourcePayments)
+        {
+            payment.OrderId = targetId;
+        }
+
+        var sourceQueueItems = await db.PrintQueue
+            .Where(x => sourceSet.Contains(x.OrderId))
+            .ToListAsync(ct);
+        foreach (var queueItem in sourceQueueItems)
+        {
+            queueItem.OrderId = targetId;
+        }
+
+        var sourceOrders = orders.Where(x => sourceSet.Contains(x.Id)).ToList();
+        if (sourceOrders.Count > 0)
+        {
+            db.Orders.RemoveRange(sourceOrders);
+        }
+
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        return new MergeOrdersResult(
+            TargetOrderId: targetId,
+            TargetOrderNo: target.OrderNo.ToString("00"),
+            MergedOrderIds: sourceIds,
+            MergedOrderCount: sourceIds.Count,
+            MovedItemsCount: sourceItems.Count,
+            MovedPaymentsCount: sourcePayments.Count,
+            MovedPrintQueueCount: sourceQueueItems.Count);
+    }
+
     public async Task<List<object>> KitchenPendingItemsForPrinter(Guid orderId, Guid printerId, CancellationToken ct)
     {
         var rows = await db.OrderItems
@@ -1235,6 +1332,30 @@ public sealed record OrderPatch(
     double? ServiceFeePercent,
     bool HasIsTakeaway,
     bool? IsTakeaway);
+
+public sealed record MergeOrdersResult(
+    Guid TargetOrderId,
+    string TargetOrderNo,
+    IReadOnlyList<Guid> MergedOrderIds,
+    int MergedOrderCount,
+    int MovedItemsCount,
+    int MovedPaymentsCount,
+    int MovedPrintQueueCount)
+{
+    public object ToJson()
+    {
+        return new
+        {
+            targetOrderId = TargetOrderId,
+            targetOrderNo = TargetOrderNo,
+            mergedOrderIds = MergedOrderIds,
+            mergedOrderCount = MergedOrderCount,
+            movedItemsCount = MovedItemsCount,
+            movedPaymentsCount = MovedPaymentsCount,
+            movedPrintQueueCount = MovedPrintQueueCount,
+        };
+    }
+}
 
 public sealed class PosRuleException(string code) : Exception(code)
 {
