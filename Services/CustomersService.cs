@@ -1,9 +1,9 @@
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
-using PosBackend.AspNet.Data;
-using PosBackend.AspNet.Models;
+using ResPosBackend.Data;
+using ResPosBackend.Models;
 
-namespace PosBackend.AspNet.Services;
+namespace ResPosBackend.Services;
 
 public sealed class CustomersService(PosDbContext db)
 {

@@ -1,4 +1,4 @@
-namespace PosBackend.AspNet.Models;
+namespace ResPosBackend.Models;
 
 public enum PosRole
 {

@@ -1,10 +1,10 @@
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
-using PosBackend.AspNet.Data;
-using PosBackend.AspNet.Infrastructure;
-using PosBackend.AspNet.Models;
-using PosBackend.AspNet.Services;
+using ResPosBackend.Data;
+using ResPosBackend.Infrastructure;
+using ResPosBackend.Models;
+using ResPosBackend.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 

@@ -1,6 +1,6 @@
-using PosBackend.AspNet.Models;
+using ResPosBackend.Models;
 
-namespace PosBackend.AspNet.Infrastructure;
+namespace ResPosBackend.Infrastructure;
 
 public static class AuthContextExtensions
 {

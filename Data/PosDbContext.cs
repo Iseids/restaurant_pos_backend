@@ -1,7 +1,7 @@
 using Microsoft.EntityFrameworkCore;
-using PosBackend.AspNet.Models;
+using ResPosBackend.Models;
 
-namespace PosBackend.AspNet.Data;
+namespace ResPosBackend.Data;
 
 public sealed class PosDbContext(DbContextOptions<PosDbContext> options) : DbContext(options)
 {

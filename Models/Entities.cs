@@ -1,7 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 
-namespace PosBackend.AspNet.Models;
+namespace ResPosBackend.Models;
 
 [Table("pos_users")]
 public sealed class PosUser

@@ -1,4 +1,4 @@
-namespace PosBackend.AspNet.Infrastructure;
+namespace ResPosBackend.Infrastructure;
 
 public static class PosSettingKeys
 {

@@ -1,7 +1,7 @@
 using Microsoft.EntityFrameworkCore;
-using PosBackend.AspNet.Data;
+using ResPosBackend.Data;
 
-namespace PosBackend.AspNet.Services;
+namespace ResPosBackend.Services;
 
 public sealed class ReportsService(PosDbContext db)
 {

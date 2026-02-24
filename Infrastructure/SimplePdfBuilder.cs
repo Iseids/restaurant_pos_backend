@@ -1,7 +1,7 @@
 using System.Globalization;
 using System.Text;
 
-namespace PosBackend.AspNet.Infrastructure;
+namespace ResPosBackend.Infrastructure;
 
 public static class SimplePdfBuilder
 {
