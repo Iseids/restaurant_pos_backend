@@ -1,10 +1,16 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using ResPosBackend.Data;
 using ResPosBackend.Models;
 
 namespace ResPosBackend.Services;
 
-public sealed class OrdersService(PosDbContext db)
+public sealed class OrdersService(
+    PosDbContext db,
+    AuditService audit,
+    ILogger<OrdersService> logger,
+    SystemAccountsService systemAccounts)
 {
     public async Task<List<object>> ListOpenOrders(CancellationToken ct)
     {
@@ -20,6 +26,7 @@ public sealed class OrdersService(PosDbContext db)
                 o.BusinessDate,
                 o.OrderNo,
                 o.Status,
+                o.Nickname,
                 TableName = t != null ? t.Name : null,
                 o.PeopleCount,
                 o.IsTakeaway,
@@ -34,11 +41,145 @@ public sealed class OrdersService(PosDbContext db)
             businessDate = r.BusinessDate.ToString("yyyy-MM-dd"),
             orderNo = r.OrderNo.ToString("00"),
             status = r.Status,
+            nickname = r.Nickname,
             tableName = r.TableName,
             peopleCount = r.PeopleCount,
             isTakeaway = r.IsTakeaway,
             createdAt = r.CreatedAt,
         }).ToList();
+    }
+
+    public async Task<object?> ListCurrentShiftOrdersHistory(CancellationToken ct)
+    {
+        var shift = await db.Shifts
+            .AsNoTracking()
+            .OrderByDescending(x => x.OpenedAt)
+            .FirstOrDefaultAsync(x => x.ClosedAt == null, ct);
+
+        if (shift is null)
+        {
+            return null;
+        }
+
+        var orders = await (
+            from o in db.Orders.AsNoTracking()
+            join t in db.Tables.AsNoTracking() on o.TableId equals t.Id into tables
+            from t in tables.DefaultIfEmpty()
+            where o.ShiftId == shift.Id
+            orderby o.CreatedAt descending
+            select new
+            {
+                o.Id,
+                o.OrderNo,
+                o.Status,
+                o.Nickname,
+                o.IsTakeaway,
+                TableName = t != null ? t.Name : null,
+                o.CreatedAt,
+                o.CustomerDiscountPercent,
+                o.DiscountAmount,
+                o.DiscountPercent,
+                o.ServiceFee,
+                o.ServiceFeePercent,
+            })
+            .Take(500)
+            .ToListAsync(ct);
+
+        if (orders.Count == 0)
+        {
+            return new
+            {
+                shiftId = shift.Id,
+                openedAt = shift.OpenedAt,
+                items = Array.Empty<object>(),
+            };
+        }
+
+        var orderIds = orders.Select(x => x.Id).ToList();
+
+        var itemRows = await db.OrderItems
+            .AsNoTracking()
+            .Where(x => orderIds.Contains(x.OrderId))
+            .Select(x => new
+            {
+                x.OrderId,
+                x.Qty,
+                x.UnitPrice,
+                x.DiscountAmount,
+                x.DiscountPercent,
+                x.Voided,
+            })
+            .ToListAsync(ct);
+
+        var paymentRows = await db.Payments
+            .AsNoTracking()
+            .Where(x => orderIds.Contains(x.OrderId))
+            .Select(x => new { x.OrderId, x.Method, x.Amount })
+            .ToListAsync(ct);
+
+        var itemsByOrder = itemRows
+            .GroupBy(x => x.OrderId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var paymentsByOrder = paymentRows
+            .GroupBy(x => x.OrderId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var output = orders.Select(o =>
+        {
+            var orderPayload = new Dictionary<string, object?>
+            {
+                ["customerDiscountPercent"] = (double)o.CustomerDiscountPercent,
+                ["orderDiscountAmount"] = (double)o.DiscountAmount,
+                ["orderDiscountPercent"] = (double)o.DiscountPercent,
+                ["serviceFeeAmount"] = (double)o.ServiceFee,
+                ["serviceFeePercent"] = (double)o.ServiceFeePercent,
+            };
+
+            var orderItems = itemsByOrder.TryGetValue(o.Id, out var rows)
+                ? rows.Select(x => (IDictionary<string, object?>)new Dictionary<string, object?>
+                {
+                    ["qty"] = (double)x.Qty,
+                    ["unitPrice"] = (double)x.UnitPrice,
+                    ["discountAmount"] = (double)x.DiscountAmount,
+                    ["discountPercent"] = (double)x.DiscountPercent,
+                    ["voided"] = x.Voided,
+                }).ToList()
+                : [];
+
+            var orderPayments = paymentsByOrder.TryGetValue(o.Id, out var payments)
+                ? payments.Select(x => (object)new Dictionary<string, object?>
+                {
+                    ["method"] = x.Method,
+                    ["amount"] = (double)x.Amount,
+                }).ToList()
+                : [];
+
+            var totals = ComputeTotals(orderPayload, orderItems, orderPayments);
+
+            var activeItemsCount = rows?.Count(x => !x.Voided) ?? 0;
+            return (object)new
+            {
+                id = o.Id,
+                orderNo = o.OrderNo.ToString("00"),
+                status = o.Status,
+                nickname = o.Nickname,
+                tableName = o.TableName,
+                isTakeaway = o.IsTakeaway,
+                createdAt = o.CreatedAt,
+                itemsCount = activeItemsCount,
+                total = totals.TryGetValue("total", out var totalObj) ? totalObj : 0d,
+                paid = totals.TryGetValue("paid", out var paidObj) ? paidObj : 0d,
+                balance = totals.TryGetValue("balance", out var balanceObj) ? balanceObj : 0d,
+            };
+        }).ToList();
+
+        return new
+        {
+            shiftId = shift.Id,
+            openedAt = shift.OpenedAt,
+            items = output,
+        };
     }
 
     public async Task<OrderSummaryResult> CreateOrder(Guid createdBy, Guid? tableId, int? peopleCount, Guid? customerId, bool isTakeaway, CancellationToken ct)
@@ -86,7 +227,7 @@ public sealed class OrdersService(PosDbContext db)
             Id = Guid.NewGuid(),
             BusinessDate = businessDate,
             OrderNo = (short)orderNo,
-            Status = "open",
+            Status = "draft",
             TableId = tableId,
             PeopleCount = peopleCount.HasValue ? (short?)peopleCount.Value : null,
             CustomerId = customerId,
@@ -104,6 +245,23 @@ public sealed class OrdersService(PosDbContext db)
         db.Orders.Add(order);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
+
+        await WriteOrderAuditAsync(
+            actorUserId: createdBy,
+            method: "POST",
+            path: "/api/orders",
+            requestBody: new
+            {
+                orderId = order.Id,
+                businessDate = order.BusinessDate.ToString("yyyy-MM-dd"),
+                orderNo = order.OrderNo.ToString("00"),
+                tableId = order.TableId,
+                peopleCount = order.PeopleCount,
+                customerId = order.CustomerId,
+                isTakeaway = order.IsTakeaway,
+            },
+            responseBody: new { ok = true, action = "order_created" },
+            ct);
 
         return new OrderSummaryResult(
             order.Id,
@@ -170,6 +328,21 @@ public sealed class OrdersService(PosDbContext db)
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
 
+        await WriteOrderAuditAsync(
+            actorUserId: createdBy,
+            method: "POST",
+            path: $"/api/tables/{tableId}/open-order",
+            requestBody: new
+            {
+                orderId = order.Id,
+                businessDate = order.BusinessDate.ToString("yyyy-MM-dd"),
+                orderNo = order.OrderNo.ToString("00"),
+                tableId = order.TableId,
+                peopleCount = order.PeopleCount,
+            },
+            responseBody: new { ok = true, action = "order_created" },
+            ct);
+
         return new OrderSummaryResult(
             order.Id,
             order.BusinessDate.ToString("yyyy-MM-dd"),
@@ -193,6 +366,7 @@ public sealed class OrdersService(PosDbContext db)
                 o.BusinessDate,
                 o.OrderNo,
                 o.Status,
+                o.Nickname,
                 o.TableId,
                 TableName = t != null ? t.Name : null,
                 o.IsTakeaway,
@@ -283,6 +457,7 @@ public sealed class OrdersService(PosDbContext db)
             ["businessDate"] = order.BusinessDate.ToString("yyyy-MM-dd"),
             ["orderNo"] = order.OrderNo.ToString("00"),
             ["status"] = order.Status,
+            ["nickname"] = order.Nickname,
             ["tableId"] = order.TableId,
             ["tableName"] = order.TableName,
             ["isTakeaway"] = order.IsTakeaway,
@@ -342,8 +517,29 @@ public sealed class OrdersService(PosDbContext db)
 
         if (existing is not null)
         {
+            var previousQty = existing.Qty;
             existing.Qty += (decimal)qty;
             await db.SaveChangesAsync(ct);
+
+            await WriteOrderAuditAsync(
+                actorUserId: createdBy,
+                method: "POST",
+                path: $"/api/orders/{orderId}/items",
+                requestBody: new
+                {
+                    orderId,
+                    itemId = existing.Id,
+                    menuItemId,
+                    name = existing.Name,
+                    addedQty = qty,
+                    previousQty = (double)previousQty,
+                    newQty = (double)existing.Qty,
+                    note = cleanNote,
+                    customizationsCount = computed.Rows.Count,
+                },
+                responseBody: new { ok = true, action = "item_added_existing" },
+                ct);
+
             return new { itemId = existing.Id, qty = (double)existing.Qty };
         }
 
@@ -388,10 +584,28 @@ public sealed class OrdersService(PosDbContext db)
             await db.SaveChangesAsync(ct);
         }
 
+        await WriteOrderAuditAsync(
+            actorUserId: createdBy,
+            method: "POST",
+            path: $"/api/orders/{orderId}/items",
+            requestBody: new
+            {
+                orderId,
+                itemId = item.Id,
+                menuItemId,
+                name = item.Name,
+                qty,
+                unitPrice = (double)item.UnitPrice,
+                note = item.Note,
+                customizationsCount = computed.Rows.Count,
+            },
+            responseBody: new { ok = true, action = "item_added" },
+            ct);
+
         return new { itemId = item.Id, qty };
     }
 
-    public async Task UpdateItem(Guid itemId, ItemPatch patch, CancellationToken ct)
+    public async Task UpdateItem(Guid itemId, Guid userId, ItemPatch patch, CancellationToken ct)
     {
         var item = await db.OrderItems.FirstOrDefaultAsync(x => x.Id == itemId, ct);
         if (item is null)
@@ -399,6 +613,7 @@ public sealed class OrdersService(PosDbContext db)
             throw new PosNotFoundException("ORDER_ITEM_NOT_FOUND");
         }
 
+        var previousQty = item.Qty;
         decimal? newUnitPrice = null;
         string? newSignature = null;
 
@@ -466,6 +681,32 @@ public sealed class OrdersService(PosDbContext db)
         }
 
         await db.SaveChangesAsync(ct);
+
+        if (patch.Qty.HasValue)
+        {
+            var qtyDelta = (double)(item.Qty - previousQty);
+            if (Math.Abs(qtyDelta) > 0.0001d)
+            {
+                var isAddition = qtyDelta > 0;
+                await WriteOrderAuditAsync(
+                    actorUserId: userId,
+                    method: "PATCH",
+                    path: isAddition
+                        ? $"/api/orders/items/{itemId}/qty/add"
+                        : $"/api/orders/items/{itemId}/qty/remove",
+                    requestBody: new
+                    {
+                        orderId = item.OrderId,
+                        itemId = item.Id,
+                        name = item.Name,
+                        previousQty = (double)previousQty,
+                        newQty = (double)item.Qty,
+                        qtyDelta,
+                    },
+                    responseBody: new { ok = true, action = isAddition ? "item_qty_added" : "item_qty_removed" },
+                    ct);
+            }
+        }
     }
 
     public async Task VoidItem(Guid itemId, Guid userId, string reason, CancellationToken ct)
@@ -482,6 +723,21 @@ public sealed class OrdersService(PosDbContext db)
         item.VoidedAt = DateTime.UtcNow;
 
         await db.SaveChangesAsync(ct);
+
+        await WriteOrderAuditAsync(
+            actorUserId: userId,
+            method: "POST",
+            path: $"/api/orders/items/{itemId}/void",
+            requestBody: new
+            {
+                orderId = item.OrderId,
+                itemId = item.Id,
+                name = item.Name,
+                reason,
+                voidedAt = item.VoidedAt,
+            },
+            responseBody: new { ok = true, action = "item_voided" },
+            ct);
     }
 
     public async Task UpdateOrder(Guid orderId, OrderPatch patch, CancellationToken ct)
@@ -558,6 +814,13 @@ public sealed class OrdersService(PosDbContext db)
             order.ServiceFeePercent = (decimal)patch.ServiceFeePercent.Value;
         }
 
+        if (patch.HasNickname)
+        {
+            order.Nickname = string.IsNullOrWhiteSpace(patch.Nickname)
+                ? null
+                : patch.Nickname.Trim();
+        }
+
         await db.SaveChangesAsync(ct);
     }
 
@@ -569,7 +832,7 @@ public sealed class OrdersService(PosDbContext db)
             throw new PosNotFoundException("ORDER_NOT_FOUND");
         }
 
-        if (order.Status != "open")
+        if (order.Status != "open" && order.Status != "draft")
         {
             throw new PosRuleException("ORDER_NOT_OPEN");
         }
@@ -598,6 +861,10 @@ public sealed class OrdersService(PosDbContext db)
 
         order.TableId = isTakeaway ? null : tableId;
         order.IsTakeaway = isTakeaway;
+        if (order.Status == "draft")
+        {
+            order.Status = "open";
+        }
 
         await db.SaveChangesAsync(ct);
     }
@@ -609,6 +876,8 @@ public sealed class OrdersService(PosDbContext db)
             throw new PosRuleException("PAYMENT_AMOUNT_INVALID");
         }
 
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
         var order = await db.Orders.FirstOrDefaultAsync(x => x.Id == orderId, ct);
         if (order is null)
         {
@@ -617,10 +886,18 @@ public sealed class OrdersService(PosDbContext db)
 
         if (order.Status != "open")
         {
-            throw new PosRuleException("ORDER_NOT_OPEN");
+            if (order.Status == "draft")
+            {
+                order.Status = "open";
+            }
+            else
+            {
+                throw new PosRuleException("ORDER_NOT_OPEN");
+            }
         }
 
-        db.Payments.Add(new PosPayment
+        var now = DateTime.UtcNow;
+        var payment = new PosPayment
         {
             Id = Guid.NewGuid(),
             OrderId = orderId,
@@ -628,8 +905,27 @@ public sealed class OrdersService(PosDbContext db)
             Amount = (decimal)amount,
             Reference = string.IsNullOrWhiteSpace(reference) ? null : reference.Trim(),
             CreatedBy = userId,
-            CreatedAt = DateTime.UtcNow,
-        });
+            CreatedAt = now,
+        };
+        db.Payments.Add(payment);
+
+        await systemAccounts.EnsureVaultBaseAccounts(now, ct);
+        var targetAccount = await systemAccounts.ResolveAccountForPayment(order.ShiftId, method, ct);
+        if (targetAccount is not null)
+        {
+            db.AccountTransactions.Add(new PosAccountTransaction
+            {
+                Id = Guid.NewGuid(),
+                AccountId = targetAccount.Id,
+                Direction = "in",
+                Amount = (decimal)amount,
+                SourceType = "pos_payment",
+                SourceId = payment.Id,
+                Note = $"POS payment ({SystemAccountsService.NormalizeMethod(method)})",
+                CreatedBy = userId,
+                CreatedAt = now,
+            });
+        }
 
         await db.SaveChangesAsync(ct);
 
@@ -641,6 +937,24 @@ public sealed class OrdersService(PosDbContext db)
             order.Status = "paid";
             await db.SaveChangesAsync(ct);
         }
+
+        await tx.CommitAsync(ct);
+
+        await WriteOrderAuditAsync(
+            actorUserId: userId,
+            method: "POST",
+            path: $"/api/orders/{orderId}/payments",
+            requestBody: new
+            {
+                orderId,
+                method,
+                amount,
+                reference = string.IsNullOrWhiteSpace(reference) ? null : reference.Trim(),
+                orderStatusAfter = order.Status,
+                balanceAfter = balance,
+            },
+            responseBody: new { ok = true, action = "payment_added" },
+            ct);
 
         return totals;
     }
@@ -909,6 +1223,67 @@ public sealed class OrdersService(PosDbContext db)
         await tx.CommitAsync(ct);
     }
 
+    public async Task DiscardDraftOrder(Guid orderId, Guid userId, CancellationToken ct)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        var order = await db.Orders.FirstOrDefaultAsync(x => x.Id == orderId, ct);
+        if (order is null)
+        {
+            throw new PosNotFoundException("ORDER_NOT_FOUND");
+        }
+
+        if (!string.Equals(order.Status, "draft", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new PosRuleException("ORDER_NOT_DRAFT");
+        }
+
+        var items = await db.OrderItems.Where(x => x.OrderId == orderId).ToListAsync(ct);
+        if (items.Count > 0)
+        {
+            var itemIds = items.Select(x => x.Id).ToList();
+            var customizations = await db.OrderItemCustomizations
+                .Where(x => itemIds.Contains(x.OrderItemId))
+                .ToListAsync(ct);
+            if (customizations.Count > 0)
+            {
+                db.OrderItemCustomizations.RemoveRange(customizations);
+            }
+
+            db.OrderItems.RemoveRange(items);
+        }
+
+        var payments = await db.Payments.Where(x => x.OrderId == orderId).ToListAsync(ct);
+        if (payments.Count > 0)
+        {
+            db.Payments.RemoveRange(payments);
+        }
+
+        var queueItems = await db.PrintQueue.Where(x => x.OrderId == orderId).ToListAsync(ct);
+        if (queueItems.Count > 0)
+        {
+            db.PrintQueue.RemoveRange(queueItems);
+        }
+
+        db.Orders.Remove(order);
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        await WriteOrderAuditAsync(
+            actorUserId: userId,
+            method: "DELETE",
+            path: $"/api/orders/{orderId}",
+            requestBody: new
+            {
+                orderId,
+                deletedItems = items.Count,
+                deletedPayments = payments.Count,
+                deletedPrintQueueItems = queueItems.Count,
+            },
+            responseBody: new { ok = true, action = "draft_order_discarded" },
+            ct);
+    }
+
     public async Task ChangeTable(Guid orderId, Guid? newTableId, CancellationToken ct)
     {
         var order = await db.Orders.FirstOrDefaultAsync(x => x.Id == orderId, ct);
@@ -939,6 +1314,7 @@ public sealed class OrdersService(PosDbContext db)
 
     public async Task<MergeOrdersResult> MergeOrders(
         IReadOnlyList<Guid> orderIds,
+        Guid actorUserId,
         Guid? targetOrderId,
         CancellationToken ct)
     {
@@ -1023,6 +1399,23 @@ public sealed class OrdersService(PosDbContext db)
 
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
+
+        await WriteOrderAuditAsync(
+            actorUserId: actorUserId,
+            method: "POST",
+            path: "/api/orders/merge",
+            requestBody: new
+            {
+                targetOrderId = target.Id,
+                targetOrderNo = target.OrderNo.ToString("00"),
+                removedOrderIds = sourceIds,
+                removedOrdersCount = sourceIds.Count,
+                movedItemsCount = sourceItems.Count,
+                movedPaymentsCount = sourcePayments.Count,
+                movedPrintQueueCount = sourceQueueItems.Count,
+            },
+            responseBody: new { ok = true, action = "orders_merged" },
+            ct);
 
         return new MergeOrdersResult(
             TargetOrderId: targetId,
@@ -1289,9 +1682,74 @@ public sealed class OrdersService(PosDbContext db)
         };
     }
 
+    private async Task WriteOrderAuditAsync(
+        Guid actorUserId,
+        string method,
+        string path,
+        object? requestBody,
+        object? responseBody,
+        CancellationToken ct)
+    {
+        try
+        {
+            var actor = await ResolveAuditActorAsync(actorUserId, ct);
+            await audit.WriteAuditLog(
+                userId: actor?.Id ?? actorUserId,
+                username: actor?.Username,
+                role: actor?.Role,
+                method: method,
+                path: path,
+                statusCode: 200,
+                requestBody: SerializeAuditBody(requestBody),
+                responseBody: SerializeAuditBody(responseBody),
+                ct: ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex,
+                "Failed to persist order audit log for {Method} {Path} by user {UserId}",
+                method,
+                path,
+                actorUserId);
+        }
+    }
+
+    private async Task<AuditActor?> ResolveAuditActorAsync(Guid userId, CancellationToken ct)
+    {
+        if (userId == Guid.Empty)
+        {
+            return null;
+        }
+
+        return await db.Users
+            .AsNoTracking()
+            .Where(x => x.Id == userId)
+            .Select(x => new AuditActor(x.Id, x.Username, x.Role))
+            .FirstOrDefaultAsync(ct);
+    }
+
+    private static string? SerializeAuditBody(object? value)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Serialize(value);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private sealed record GroupInfo(Guid Id, string Name, bool IsRequired, int MinSelect, int? MaxSelect, bool AllowQuantity);
     private sealed record CustomizationRow(Guid GroupId, Guid OptionId, string GroupName, string OptionName, double Qty, decimal PriceDelta);
     private sealed record CustomizationComputeResult(decimal PriceDelta, string? Signature, IReadOnlyList<CustomizationRow> Rows);
+    private sealed record AuditActor(Guid Id, string Username, string Role);
 }
 
 public sealed record CustomizationSelection(Guid OptionId, double Qty);
@@ -1331,7 +1789,9 @@ public sealed record OrderPatch(
     double? ServiceFeeAmount,
     double? ServiceFeePercent,
     bool HasIsTakeaway,
-    bool? IsTakeaway);
+    bool? IsTakeaway,
+    bool HasNickname,
+    string? Nickname);
 
 public sealed record MergeOrdersResult(
     Guid TargetOrderId,

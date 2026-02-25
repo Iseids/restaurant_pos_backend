@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using ResPosBackend.Data;
 using ResPosBackend.Infrastructure;
@@ -10,6 +11,36 @@ namespace ResPosBackend.Services;
 public sealed class PrintService(PosDbContext db, OrdersService orders)
 {
     private const int Paper80LineWidth = 48;
+    private sealed record ActivePrinterRow(Guid Id, string Name, string Type, string? Address, bool IsActive);
+    private sealed record InvoiceTemplateSettings(
+        string BusinessName,
+        string? BusinessTagline,
+        string? BusinessAddress,
+        string? BusinessPhone,
+        string? BusinessTaxNumber,
+        string? HeaderNote,
+        string? FooterNote,
+        string InvoiceTitleEn,
+        string InvoiceTitleAr,
+        string ReceiptTitleEn,
+        string ReceiptTitleAr,
+        bool ShowPaymentsSection);
+
+    private sealed class InvoiceTemplatePayload
+    {
+        public string? BusinessName { get; set; }
+        public string? BusinessTagline { get; set; }
+        public string? BusinessAddress { get; set; }
+        public string? BusinessPhone { get; set; }
+        public string? BusinessTaxNumber { get; set; }
+        public string? HeaderNote { get; set; }
+        public string? FooterNote { get; set; }
+        public string? InvoiceTitleEn { get; set; }
+        public string? InvoiceTitleAr { get; set; }
+        public string? ReceiptTitleEn { get; set; }
+        public string? ReceiptTitleAr { get; set; }
+        public bool? ShowPaymentsSection { get; set; }
+    }
 
     public Task<object> PrintKitchenForOrder(Guid orderId, CancellationToken ct)
         => PrintKitchenForOrder(orderId, null, ct);
@@ -111,10 +142,8 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
 
     public async Task<List<object>> ListActivePrinters(CancellationToken ct)
     {
-        return await db.Printers
-            .AsNoTracking()
-            .Where(x => x.IsActive)
-            .OrderBy(x => x.Name)
+        var printers = await ListActivePrinterRows(ct);
+        return printers
             .Select(x => (object)new
             {
                 id = x.Id,
@@ -123,11 +152,97 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
                 address = x.Address,
                 isActive = x.IsActive,
             })
+            .ToList();
+    }
+
+    public async Task<object> GetRuntimePrinterSettings(CancellationToken ct)
+    {
+        var printers = await ListActivePrinterRows(ct);
+        var settings = await db.AppSettings
+            .AsNoTracking()
+            .Where(x =>
+                x.Key == PosSettingKeys.DefaultReceiptPrinterId ||
+                x.Key == PosSettingKeys.DefaultInvoicePrinterId ||
+                x.Key == PosSettingKeys.DefaultCashierDocumentsPrinterId)
+            .ToListAsync(ct);
+
+        Guid? ParseGuidSetting(string key)
+        {
+            var raw = settings.FirstOrDefault(x => x.Key == key)?.Value;
+            return Guid.TryParse(raw, out var parsed) ? parsed : (Guid?)null;
+        }
+
+        var receiptPrinterId = ParseGuidSetting(PosSettingKeys.DefaultReceiptPrinterId);
+        var invoicePrinterId = ParseGuidSetting(PosSettingKeys.DefaultInvoicePrinterId);
+        var cashierDocumentsPrinterId = ParseGuidSetting(PosSettingKeys.DefaultCashierDocumentsPrinterId);
+
+        if (!cashierDocumentsPrinterId.HasValue &&
+            receiptPrinterId.HasValue &&
+            invoicePrinterId.HasValue &&
+            receiptPrinterId.Value == invoicePrinterId.Value)
+        {
+            cashierDocumentsPrinterId = receiptPrinterId.Value;
+        }
+
+        var printerById = printers.ToDictionary(x => x.Id, x => x);
+        static bool IsNetworkReady(ActivePrinterRow p)
+            => string.Equals(p.Type, "network", StringComparison.OrdinalIgnoreCase) &&
+               !string.IsNullOrWhiteSpace(p.Address);
+
+        if (receiptPrinterId.HasValue &&
+            (!printerById.TryGetValue(receiptPrinterId.Value, out var receiptPrinter) ||
+             !IsNetworkReady(receiptPrinter)))
+        {
+            receiptPrinterId = null;
+        }
+
+        if (invoicePrinterId.HasValue &&
+            (!printerById.TryGetValue(invoicePrinterId.Value, out var invoicePrinter) ||
+             !IsNetworkReady(invoicePrinter)))
+        {
+            invoicePrinterId = null;
+        }
+
+        if (cashierDocumentsPrinterId.HasValue &&
+            !printerById.ContainsKey(cashierDocumentsPrinterId.Value))
+        {
+            cashierDocumentsPrinterId = null;
+        }
+
+        return new
+        {
+            printers = printers.Select(x => new
+            {
+                id = x.Id,
+                name = x.Name,
+                type = x.Type,
+                address = x.Address,
+                isActive = x.IsActive,
+            }).ToList(),
+            receiptPrinterId,
+            invoicePrinterId,
+            cashierDocumentsPrinterId,
+        };
+    }
+
+    private async Task<List<ActivePrinterRow>> ListActivePrinterRows(CancellationToken ct)
+    {
+        return await db.Printers
+            .AsNoTracking()
+            .Where(x => x.IsActive)
+            .OrderBy(x => x.Name)
+            .Select(x => new ActivePrinterRow(
+                x.Id,
+                x.Name,
+                string.IsNullOrWhiteSpace(x.Type) ? "network" : x.Type!,
+                x.Address,
+                x.IsActive))
             .ToListAsync(ct);
     }
 
     public async Task<byte[]> BuildInvoicePdf(Guid orderId, CancellationToken ct)
     {
+        var template = await LoadInvoiceTemplateSettings(ct);
         var order = await (
             from o in db.Orders.AsNoTracking()
             join t in db.Tables.AsNoTracking() on o.TableId equals t.Id into tables
@@ -159,11 +274,43 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             }).ToListAsync(ct);
 
         var totals = await orders.ComputeTotalsForOrder(orderId, ct);
+        var payments = await db.Payments.AsNoTracking()
+            .Where(x => x.OrderId == orderId)
+            .OrderBy(x => x.CreatedAt)
+            .Select(x => new { x.Method, x.Amount })
+            .ToListAsync(ct);
+
+        var subtotal = ToDouble(totals.TryGetValue("subtotal", out var subtotalObj) ? subtotalObj : null);
+        var itemDiscountTotal = ToDouble(totals.TryGetValue("itemDiscountTotal", out var itemDiscObj) ? itemDiscObj : null);
+        var serviceFee = ToDouble(totals.TryGetValue("serviceFee", out var serviceFeeObj) ? serviceFeeObj : null);
+        var total = ToDouble(totals.TryGetValue("total", out var totalObj) ? totalObj : null);
+        var paid = ToDouble(totals.TryGetValue("paid", out var paidObj) ? paidObj : null);
+        var balance = ToDouble(totals.TryGetValue("balance", out var balanceObj) ? balanceObj : null);
 
         var lines = new List<string>();
-        lines.Add($"Invoice #: {order.OrderNo:00}");
+        lines.Add(template.BusinessName);
+        if (!string.IsNullOrWhiteSpace(template.BusinessTagline))
+        {
+            lines.Add(template.BusinessTagline!);
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessAddress))
+        {
+            lines.Add(template.BusinessAddress!);
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessPhone))
+        {
+            lines.Add($"Phone: {template.BusinessPhone}");
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessTaxNumber))
+        {
+            lines.Add($"Tax ID: {template.BusinessTaxNumber}");
+        }
+        lines.Add(string.Empty);
+        lines.Add($"{template.InvoiceTitleEn} #{order.OrderNo:00}");
         lines.Add($"Table: {(order.IsTakeaway ? "Takeaway" : (string.IsNullOrWhiteSpace(order.TableName) ? "-" : order.TableName))}");
         lines.Add($"Created: {order.CreatedAt:yyyy-MM-dd HH:mm:ss}");
+        lines.Add("----------------------------------------");
+        lines.Add("Item                         Qty   Unit   Total");
         lines.Add("----------------------------------------");
 
         foreach (var item in items)
@@ -176,18 +323,37 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             var gross = qty * unit;
             var discount = discountPercent > 0 ? gross * (discountPercent / 100d) : discountAmount;
             var net = Math.Max(0, gross - discount);
-            lines.Add($"{name} x{qty:0.###}  {net:0.##}");
+            lines.Add(name);
+            lines.Add($"  {qty:0.###} x {unit:0.##} = {net:0.##}");
+            if (discount > 0)
+            {
+                lines.Add($"  Discount: -{discount:0.##}");
+            }
         }
 
         lines.Add("----------------------------------------");
-        lines.Add($"Subtotal: {ToDouble(totals.TryGetValue("subtotal", out var subtotalObj) ? subtotalObj : null):0.##}");
-        lines.Add($"Discounts: {ToDouble(totals.TryGetValue("itemDiscountTotal", out var itemDiscObj) ? itemDiscObj : null):0.##}");
-        lines.Add($"Service Fee: {ToDouble(totals.TryGetValue("serviceFee", out var serviceFeeObj) ? serviceFeeObj : null):0.##}");
-        lines.Add($"Total: {ToDouble(totals.TryGetValue("total", out var totalObj) ? totalObj : null):0.##}");
-        lines.Add($"Paid: {ToDouble(totals.TryGetValue("paid", out var paidObj) ? paidObj : null):0.##}");
-        lines.Add($"Balance: {ToDouble(totals.TryGetValue("balance", out var balanceObj) ? balanceObj : null):0.##}");
+        lines.Add($"Subtotal: {subtotal:0.##}");
+        lines.Add($"Discounts: {itemDiscountTotal:0.##}");
+        lines.Add($"Service Fee: {serviceFee:0.##}");
+        lines.Add($"Total: {total:0.##}");
+        lines.Add($"Paid: {paid:0.##}");
+        lines.Add($"Balance: {balance:0.##}");
+        if (template.ShowPaymentsSection && payments.Count > 0)
+        {
+            lines.Add("----------------------------------------");
+            lines.Add("Payments");
+            foreach (var pay in payments)
+            {
+                lines.Add($"{pay.Method}: {(double)pay.Amount:0.##}");
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(template.FooterNote))
+        {
+            lines.Add("----------------------------------------");
+            lines.Add(template.FooterNote!);
+        }
 
-        return SimplePdfBuilder.BuildSinglePageText(lines, "Restaurant POS - Invoice");
+        return SimplePdfBuilder.BuildSinglePageText(lines, $"{template.BusinessName} - {template.InvoiceTitleEn}");
     }
 
     public Task PrintReceipt(Guid orderId, Guid? printerId, CancellationToken ct)
@@ -494,6 +660,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
 
     private async Task<byte[]> BuildReceiptTicketBytes(Guid orderId, string? language, CancellationToken ct)
     {
+        var template = await LoadInvoiceTemplateSettings(ct);
         var order = await (
             from o in db.Orders.AsNoTracking()
             join t in db.Tables.AsNoTracking() on o.TableId equals t.Id into tables
@@ -535,20 +702,50 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         var totals = await orders.ComputeTotalsForOrder(orderId, ct);
 
         var isArabic = IsArabicLanguage(language);
-        var title = isArabic ? "نظام نقاط البيع" : "Restaurant POS";
-        var receiptLabel = isArabic ? "إيصال" : "Receipt";
+        var title = template.BusinessName;
+        var receiptLabel = isArabic ? template.ReceiptTitleAr : template.ReceiptTitleEn;
         var tableLabel = isArabic ? "الطاولة" : "Table";
         var takeawayLabel = isArabic ? "سفري" : "Takeaway";
         var peopleLabel = isArabic ? "الأشخاص" : "People";
         var timeLabel = isArabic ? "الوقت" : "Time";
+        var subtotalLabel = isArabic ? "المجموع الفرعي" : "Subtotal";
+        var discountLabel = isArabic ? "الخصم" : "Discounts";
+        var serviceLabel = isArabic ? "رسوم الخدمة" : "Service Fee";
         var totalLabel = isArabic ? "الإجمالي" : "Total";
         var paidLabel = isArabic ? "المدفوع" : "Paid";
         var dueLabel = isArabic ? "المتبقي" : "Due";
         var paymentLabel = isArabic ? "المدفوعات" : "Payments";
         var tableValue = order.IsTakeaway ? takeawayLabel : (order.TableName ?? "-");
+        var subtotal = ToDouble(totals.TryGetValue("subtotal", out var subtotalObj) ? subtotalObj : null);
+        var itemDiscountTotal = ToDouble(totals.TryGetValue("itemDiscountTotal", out var itemDiscObj) ? itemDiscObj : null);
+        var serviceFee = ToDouble(totals.TryGetValue("serviceFee", out var serviceFeeObj) ? serviceFeeObj : null);
+        var total = ToDouble(totals.TryGetValue("total", out var totalObj) ? totalObj : null);
+        var paid = ToDouble(totals.TryGetValue("paid", out var paidObj) ? paidObj : null);
+        var due = ToDouble(totals.TryGetValue("balance", out var balanceObj) ? balanceObj : null);
 
         var sb = new StringBuilder();
         sb.AppendLine(title);
+        if (!string.IsNullOrWhiteSpace(template.BusinessTagline))
+        {
+            sb.AppendLine(template.BusinessTagline);
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessAddress))
+        {
+            sb.AppendLine(template.BusinessAddress);
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessPhone))
+        {
+            sb.AppendLine($"{(isArabic ? "هاتف" : "Phone")}: {template.BusinessPhone}");
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessTaxNumber))
+        {
+            sb.AppendLine($"{(isArabic ? "رقم ضريبي" : "Tax ID")}: {template.BusinessTaxNumber}");
+        }
+        if (!string.IsNullOrWhiteSpace(template.HeaderNote))
+        {
+            sb.AppendLine(template.HeaderNote);
+        }
+        sb.AppendLine(new string('-', Paper80LineWidth));
         sb.AppendLine($"{receiptLabel} #{order.OrderNo:00}");
         sb.AppendLine($"{tableLabel}: {tableValue}");
         if (order.PeopleCount.HasValue)
@@ -567,18 +764,34 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
                 ? gross * ((double)item.DiscountPercent / 100d)
                 : (double)item.DiscountAmount;
             var net = Math.Max(0, gross - disc);
-            sb.AppendLine($"{item.Name} x{qty:0.###}  {net:0.##}");
+            sb.AppendLine(item.Name);
+            sb.AppendLine($"  {qty:0.###} x {unit:0.##} = {net:0.##}");
+            if (disc > 0)
+            {
+                sb.AppendLine($"  {(isArabic ? "خصم" : "Discount")}: -{disc:0.##}");
+            }
         }
 
         sb.AppendLine(new string('-', Paper80LineWidth));
-        sb.AppendLine($"{totalLabel}: {Convert.ToDouble(totals["total"]):0.##}");
-        sb.AppendLine($"{paidLabel}: {Convert.ToDouble(totals["paid"]):0.##}");
-        sb.AppendLine($"{dueLabel}: {Convert.ToDouble(totals["balance"]):0.##}");
-        sb.AppendLine(new string('-', Paper80LineWidth));
-        sb.AppendLine(paymentLabel);
-        foreach (var pay in payments)
+        sb.AppendLine($"{subtotalLabel}: {subtotal:0.##}");
+        sb.AppendLine($"{discountLabel}: {itemDiscountTotal:0.##}");
+        sb.AppendLine($"{serviceLabel}: {serviceFee:0.##}");
+        sb.AppendLine($"{totalLabel}: {total:0.##}");
+        sb.AppendLine($"{paidLabel}: {paid:0.##}");
+        sb.AppendLine($"{dueLabel}: {due:0.##}");
+        if (template.ShowPaymentsSection && payments.Count > 0)
         {
-            sb.AppendLine($"{pay.Method}: {(double)pay.Amount:0.##}");
+            sb.AppendLine(new string('-', Paper80LineWidth));
+            sb.AppendLine(paymentLabel);
+            foreach (var pay in payments)
+            {
+                sb.AppendLine($"{pay.Method}: {(double)pay.Amount:0.##}");
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(template.FooterNote))
+        {
+            sb.AppendLine(new string('-', Paper80LineWidth));
+            sb.AppendLine(template.FooterNote);
         }
         sb.AppendLine();
         sb.AppendLine();
@@ -588,6 +801,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
 
     private async Task<byte[]> BuildInvoiceTicketBytes(Guid orderId, string? language, CancellationToken ct)
     {
+        var template = await LoadInvoiceTemplateSettings(ct);
         var order = await (
             from o in db.Orders.AsNoTracking()
             join t in db.Tables.AsNoTracking() on o.TableId equals t.Id into tables
@@ -623,7 +837,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         var totals = await orders.ComputeTotalsForOrder(orderId, ct);
 
         var isArabic = IsArabicLanguage(language);
-        var title = isArabic ? "فاتورة" : "Invoice";
+        var title = isArabic ? template.InvoiceTitleAr : template.InvoiceTitleEn;
         var tableLabel = isArabic ? "الطاولة" : "Table";
         var takeawayLabel = isArabic ? "سفري" : "Takeaway";
         var peopleLabel = isArabic ? "الأشخاص" : "People";
@@ -635,8 +849,36 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         var paidLabel = isArabic ? "المدفوع" : "Paid";
         var balanceLabel = isArabic ? "المتبقي" : "Balance";
         var tableValue = order.IsTakeaway ? takeawayLabel : (order.TableName ?? "-");
+        var subtotal = ToDouble(totals.TryGetValue("subtotal", out var subtotalObj) ? subtotalObj : null);
+        var itemDiscountTotal = ToDouble(totals.TryGetValue("itemDiscountTotal", out var itemDiscObj) ? itemDiscObj : null);
+        var serviceFee = ToDouble(totals.TryGetValue("serviceFee", out var serviceFeeObj) ? serviceFeeObj : null);
+        var total = ToDouble(totals.TryGetValue("total", out var totalObj) ? totalObj : null);
+        var paid = ToDouble(totals.TryGetValue("paid", out var paidObj) ? paidObj : null);
+        var balance = ToDouble(totals.TryGetValue("balance", out var balanceObj) ? balanceObj : null);
 
         var sb = new StringBuilder();
+        sb.AppendLine(template.BusinessName);
+        if (!string.IsNullOrWhiteSpace(template.BusinessTagline))
+        {
+            sb.AppendLine(template.BusinessTagline);
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessAddress))
+        {
+            sb.AppendLine(template.BusinessAddress);
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessPhone))
+        {
+            sb.AppendLine($"{(isArabic ? "هاتف" : "Phone")}: {template.BusinessPhone}");
+        }
+        if (!string.IsNullOrWhiteSpace(template.BusinessTaxNumber))
+        {
+            sb.AppendLine($"{(isArabic ? "رقم ضريبي" : "Tax ID")}: {template.BusinessTaxNumber}");
+        }
+        if (!string.IsNullOrWhiteSpace(template.HeaderNote))
+        {
+            sb.AppendLine(template.HeaderNote);
+        }
+        sb.AppendLine(new string('-', Paper80LineWidth));
         sb.AppendLine($"{title} #{order.OrderNo:00}");
         sb.AppendLine($"{tableLabel}: {tableValue}");
         if (order.PeopleCount.HasValue)
@@ -655,20 +897,102 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
                 ? gross * ((double)item.DiscountPercent / 100d)
                 : (double)item.DiscountAmount;
             var net = Math.Max(0, gross - disc);
-            sb.AppendLine($"{item.Name} x{qty:0.###}  {net:0.##}");
+            sb.AppendLine(item.Name);
+            sb.AppendLine($"  {qty:0.###} x {unit:0.##} = {net:0.##}");
+            if (disc > 0)
+            {
+                sb.AppendLine($"  {(isArabic ? "خصم" : "Discount")}: -{disc:0.##}");
+            }
         }
 
         sb.AppendLine(new string('-', Paper80LineWidth));
-        sb.AppendLine($"{subtotalLabel}: {Convert.ToDouble(totals["subtotal"]):0.##}");
-        sb.AppendLine($"{discountLabel}: {Convert.ToDouble(totals["itemDiscountTotal"]):0.##}");
-        sb.AppendLine($"{serviceLabel}: {Convert.ToDouble(totals["serviceFee"]):0.##}");
-        sb.AppendLine($"{totalLabel}: {Convert.ToDouble(totals["total"]):0.##}");
-        sb.AppendLine($"{paidLabel}: {Convert.ToDouble(totals["paid"]):0.##}");
-        sb.AppendLine($"{balanceLabel}: {Convert.ToDouble(totals["balance"]):0.##}");
+        sb.AppendLine($"{subtotalLabel}: {subtotal:0.##}");
+        sb.AppendLine($"{discountLabel}: {itemDiscountTotal:0.##}");
+        sb.AppendLine($"{serviceLabel}: {serviceFee:0.##}");
+        sb.AppendLine($"{totalLabel}: {total:0.##}");
+        sb.AppendLine($"{paidLabel}: {paid:0.##}");
+        sb.AppendLine($"{balanceLabel}: {balance:0.##}");
+        if (!string.IsNullOrWhiteSpace(template.FooterNote))
+        {
+            sb.AppendLine(new string('-', Paper80LineWidth));
+            sb.AppendLine(template.FooterNote);
+        }
         sb.AppendLine();
         sb.AppendLine();
 
         return WrapEscPosText(sb.ToString());
+    }
+
+    private async Task<InvoiceTemplateSettings> LoadInvoiceTemplateSettings(CancellationToken ct)
+    {
+        var raw = await db.AppSettings.AsNoTracking()
+            .Where(x => x.Key == PosSettingKeys.InvoiceTemplateConfig)
+            .Select(x => x.Value)
+            .FirstOrDefaultAsync(ct);
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return DefaultInvoiceTemplateSettings();
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Deserialize<InvoiceTemplatePayload>(raw);
+            return NormalizeInvoiceTemplate(payload);
+        }
+        catch
+        {
+            return DefaultInvoiceTemplateSettings();
+        }
+    }
+
+    private static InvoiceTemplateSettings DefaultInvoiceTemplateSettings() => new(
+        BusinessName: "Restaurant POS",
+        BusinessTagline: "Fresh food and fast service",
+        BusinessAddress: null,
+        BusinessPhone: null,
+        BusinessTaxNumber: null,
+        HeaderNote: null,
+        FooterNote: "Thank you for your visit",
+        InvoiceTitleEn: "Invoice",
+        InvoiceTitleAr: "فاتورة",
+        ReceiptTitleEn: "Receipt",
+        ReceiptTitleAr: "إيصال",
+        ShowPaymentsSection: true);
+
+    private static InvoiceTemplateSettings NormalizeInvoiceTemplate(InvoiceTemplatePayload? payload)
+    {
+        var defaults = DefaultInvoiceTemplateSettings();
+        if (payload is null)
+        {
+            return defaults;
+        }
+
+        return new InvoiceTemplateSettings(
+            BusinessName: NormalizeRequiredText(payload.BusinessName, defaults.BusinessName),
+            BusinessTagline: NormalizeOptionalText(payload.BusinessTagline),
+            BusinessAddress: NormalizeOptionalText(payload.BusinessAddress),
+            BusinessPhone: NormalizeOptionalText(payload.BusinessPhone),
+            BusinessTaxNumber: NormalizeOptionalText(payload.BusinessTaxNumber),
+            HeaderNote: NormalizeOptionalText(payload.HeaderNote),
+            FooterNote: NormalizeOptionalText(payload.FooterNote),
+            InvoiceTitleEn: NormalizeRequiredText(payload.InvoiceTitleEn, defaults.InvoiceTitleEn),
+            InvoiceTitleAr: NormalizeRequiredText(payload.InvoiceTitleAr, defaults.InvoiceTitleAr),
+            ReceiptTitleEn: NormalizeRequiredText(payload.ReceiptTitleEn, defaults.ReceiptTitleEn),
+            ReceiptTitleAr: NormalizeRequiredText(payload.ReceiptTitleAr, defaults.ReceiptTitleAr),
+            ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection);
+    }
+
+    private static string NormalizeRequiredText(string? raw, string fallback)
+    {
+        var text = raw?.Trim();
+        return string.IsNullOrWhiteSpace(text) ? fallback : text;
+    }
+
+    private static string? NormalizeOptionalText(string? raw)
+    {
+        var text = raw?.Trim();
+        return string.IsNullOrWhiteSpace(text) ? null : text;
     }
 
     private async Task<PosPrinter> ResolveReceiptPrinter(Guid? printerId, CancellationToken ct)
@@ -676,6 +1000,20 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         if (printerId.HasValue)
         {
             return await ResolveActiveNetworkPrinter(printerId.Value, "Receipt printer not found or inactive", "receipt", ct);
+        }
+
+        var defaultCashierDocumentsPrinterId = await GetSettingGuid(PosSettingKeys.DefaultCashierDocumentsPrinterId, ct);
+        if (defaultCashierDocumentsPrinterId.HasValue)
+        {
+            try
+            {
+                return await ResolveActiveNetworkPrinter(defaultCashierDocumentsPrinterId.Value, "Receipt printer not found or inactive", "receipt", ct);
+            }
+            catch (InvalidOperationException)
+            {
+                // Cashier documents printer may be non-network (e.g. print-to-file).
+                // Fall through to receipt/invoice defaults that are guaranteed network-compatible.
+            }
         }
 
         var defaultReceiptPrinterId = await GetSettingGuid(PosSettingKeys.DefaultReceiptPrinterId, ct);
@@ -703,6 +1041,20 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         if (printerId.HasValue)
         {
             return await ResolveActiveNetworkPrinter(printerId.Value, "Invoice printer not found or inactive", "invoice", ct);
+        }
+
+        var defaultCashierDocumentsPrinterId = await GetSettingGuid(PosSettingKeys.DefaultCashierDocumentsPrinterId, ct);
+        if (defaultCashierDocumentsPrinterId.HasValue)
+        {
+            try
+            {
+                return await ResolveActiveNetworkPrinter(defaultCashierDocumentsPrinterId.Value, "Invoice printer not found or inactive", "invoice", ct);
+            }
+            catch (InvalidOperationException)
+            {
+                // Cashier documents printer may be non-network (e.g. print-to-file).
+                // Fall through to invoice/receipt defaults that are network-compatible.
+            }
         }
 
         var defaultInvoicePrinterId = await GetSettingGuid(PosSettingKeys.DefaultInvoicePrinterId, ct);

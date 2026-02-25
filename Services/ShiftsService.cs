@@ -4,7 +4,7 @@ using ResPosBackend.Models;
 
 namespace ResPosBackend.Services;
 
-public sealed class ShiftsService(PosDbContext db)
+public sealed class ShiftsService(PosDbContext db, SystemAccountsService systemAccounts)
 {
     public async Task<object?> GetCurrentShiftSummary(CancellationToken ct)
     {
@@ -41,23 +41,44 @@ public sealed class ShiftsService(PosDbContext db)
 
     public async Task<object> OpenShift(Guid userId, double openingCash, string? note, CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
         var hasOpenShift = await db.Shifts.AnyAsync(x => x.ClosedAt == null, ct);
         if (hasOpenShift)
         {
             throw new InvalidOperationException("SHIFT_ALREADY_OPEN");
         }
 
+        var now = DateTime.UtcNow;
         var shift = new PosShift
         {
             Id = Guid.NewGuid(),
             OpenedBy = userId,
-            OpenedAt = DateTime.UtcNow,
+            OpenedAt = now,
             OpeningCash = (decimal)openingCash,
             Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim(),
         };
 
         db.Shifts.Add(shift);
+        var sessionAccounts = await systemAccounts.EnsureShiftSessionAccounts(shift, now, ct);
+        if (openingCash > 0 && sessionAccounts.TryGetValue("cash", out var cashAccount))
+        {
+            db.AccountTransactions.Add(new PosAccountTransaction
+            {
+                Id = Guid.NewGuid(),
+                AccountId = cashAccount.Id,
+                Direction = "in",
+                Amount = (decimal)openingCash,
+                SourceType = "shift_opening_cash",
+                SourceId = shift.Id,
+                Note = "Shift opening cash",
+                CreatedBy = userId,
+                CreatedAt = now,
+            });
+        }
+
         await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
 
         return new
         {
@@ -79,6 +100,8 @@ public sealed class ShiftsService(PosDbContext db)
 
     public async Task<object?> CloseShift(Guid userId, Guid shiftId, double closingCash, string? note, CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
         var shift = await db.Shifts.FirstOrDefaultAsync(x => x.Id == shiftId && x.ClosedAt == null, ct);
         if (shift is null)
         {
@@ -94,7 +117,41 @@ public sealed class ShiftsService(PosDbContext db)
             shift.Note = note.Trim();
         }
 
+        decimal cashAdjustment = 0m;
+        var shiftCashAccount = await db.Accounts.FirstOrDefaultAsync(x =>
+            x.AccountScope == SystemAccountsService.ShiftSessionScope &&
+            x.ShiftId == shift.Id &&
+            x.AccountKey == "cash",
+            ct);
+
+        if (shiftCashAccount is not null)
+        {
+            var currentCashBalance = await db.AccountTransactions
+                .Where(x => x.AccountId == shiftCashAccount.Id)
+                .SumAsync(x => x.Direction == "in" ? x.Amount : -x.Amount, ct);
+
+            cashAdjustment = (decimal)closingCash - currentCashBalance;
+            if (Math.Abs(cashAdjustment) > 0.0001m)
+            {
+                db.AccountTransactions.Add(new PosAccountTransaction
+                {
+                    Id = Guid.NewGuid(),
+                    AccountId = shiftCashAccount.Id,
+                    Direction = cashAdjustment >= 0 ? "in" : "out",
+                    Amount = Math.Abs(cashAdjustment),
+                    SourceType = "shift_cash_adjustment",
+                    SourceId = shift.Id,
+                    Note = "Shift close cash reconciliation",
+                    CreatedBy = userId,
+                    CreatedAt = closedAt,
+                });
+            }
+        }
+
         await db.SaveChangesAsync(ct);
+        var mergeEntries = await systemAccounts.MergeShiftAccountsToVault(shift.Id, userId, closedAt, ct);
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
 
         var totals = await PaymentTotals(shift.OpenedAt, closedAt, ct);
         var expectedCash = (double)shift.OpeningCash + totals.Cash;
@@ -113,6 +170,14 @@ public sealed class ShiftsService(PosDbContext db)
             totals = new { cash = totals.Cash, card = totals.Card, cheque = totals.Cheque },
             expectedCash,
             difference,
+            cashAdjustment = (double)cashAdjustment,
+            mergedAccounts = mergeEntries.Select(x => new
+            {
+                method = x.Method,
+                fromAccountId = x.FromAccountId,
+                toAccountId = x.ToAccountId,
+                amount = (double)x.Amount,
+            }).ToList(),
         };
     }
 

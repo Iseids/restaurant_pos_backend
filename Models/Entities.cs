@@ -24,6 +24,7 @@ public sealed class PosUser
 
     [Column("created_at")]
     public DateTime CreatedAt { get; set; }
+
 }
 
 [Table("pos_sessions")]
@@ -272,6 +273,9 @@ public sealed class PosOrder
 
     [Column("service_fee_percent")]
     public decimal ServiceFeePercent { get; set; }
+
+    [Column("nickname")]
+    public string? Nickname { get; set; }
 
     [Column("created_by")]
     public Guid CreatedBy { get; set; }
@@ -536,6 +540,50 @@ public sealed class PosAccount
     [Column("is_active")]
     public bool IsActive { get; set; }
 
+    [Column("account_scope")]
+    public string AccountScope { get; set; } = "custom";
+
+    [Column("account_key")]
+    public string? AccountKey { get; set; }
+
+    [Column("is_system")]
+    public bool IsSystem { get; set; }
+
+    [Column("is_locked")]
+    public bool IsLocked { get; set; }
+
+    [Column("shift_id")]
+    public Guid? ShiftId { get; set; }
+
+    [Column("base_account_id")]
+    public Guid? BaseAccountId { get; set; }
+
+    [Column("parent_account_id")]
+    public Guid? ParentAccountId { get; set; }
+
+    [Column("created_at")]
+    public DateTime CreatedAt { get; set; }
+}
+
+[Table("pos_account_relations")]
+public sealed class PosAccountRelation
+{
+    [Key]
+    [Column("id")]
+    public Guid Id { get; set; }
+
+    [Column("from_account_id")]
+    public Guid FromAccountId { get; set; }
+
+    [Column("to_account_id")]
+    public Guid ToAccountId { get; set; }
+
+    [Column("percentage")]
+    public decimal Percentage { get; set; }
+
+    [Column("kind")]
+    public string Kind { get; set; } = "allocation";
+
     [Column("created_at")]
     public DateTime CreatedAt { get; set; }
 }
@@ -569,6 +617,9 @@ public sealed class PosSupplier
 
     [Column("note")]
     public string? Note { get; set; }
+
+    [Column("account_id")]
+    public Guid? AccountId { get; set; }
 
     [Column("is_active")]
     public bool IsActive { get; set; }
@@ -627,6 +678,9 @@ public sealed class PosExpense
 
     [Column("supplier_id")]
     public Guid? SupplierId { get; set; }
+
+    [Column("employee_id")]
+    public Guid? EmployeeId { get; set; }
 
     [Column("amount")]
     public decimal Amount { get; set; }
@@ -730,6 +784,9 @@ public sealed class PosEmployee
     [Column("note")]
     public string? Note { get; set; }
 
+    [Column("account_id")]
+    public Guid? AccountId { get; set; }
+
     [Column("is_active")]
     public bool IsActive { get; set; }
 
@@ -775,4 +832,39 @@ public sealed class PosEmployeeTimeEntry
     public DateTime UpdatedAt { get; set; }
 
     public PosEmployee? Employee { get; set; }
+}
+
+[Table("pos_audit_logs")]
+public sealed class PosAuditLog
+{
+    [Key]
+    [Column("id")]
+    public Guid Id { get; set; }
+
+    [Column("user_id")]
+    public Guid? UserId { get; set; }
+
+    [Column("username")]
+    public string? Username { get; set; }
+
+    [Column("role")]
+    public string? Role { get; set; }
+
+    [Column("method")]
+    public string Method { get; set; } = string.Empty;
+
+    [Column("path")]
+    public string Path { get; set; } = string.Empty;
+
+    [Column("status_code")]
+    public int StatusCode { get; set; }
+
+    [Column("request_body")]
+    public string? RequestBody { get; set; }
+
+    [Column("response_body")]
+    public string? ResponseBody { get; set; }
+
+    [Column("created_at")]
+    public DateTime CreatedAt { get; set; }
 }

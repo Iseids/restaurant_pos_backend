@@ -13,6 +13,7 @@ builder.Configuration.AddEnvironmentVariables();
 var connectionString = DatabaseConnectionString.Build(builder.Configuration);
 
 builder.Services.AddDbContext<PosDbContext>(opt => opt.UseNpgsql(connectionString));
+builder.Services.AddHttpClient();
 builder.Services.AddScoped<AuthService>();
 builder.Services.AddScoped<MenuService>();
 builder.Services.AddScoped<TablesService>();
@@ -24,6 +25,8 @@ builder.Services.AddScoped<AdminService>();
 builder.Services.AddScoped<AccountingService>();
 builder.Services.AddScoped<ReportsService>();
 builder.Services.AddScoped<PayrollService>();
+builder.Services.AddScoped<AuditService>();
+builder.Services.AddScoped<SystemAccountsService>();
 builder.Services.AddScoped<DevelopmentDataSeeder>();
 
 builder.Services.AddCors(opt =>
@@ -35,6 +38,12 @@ builder.Services.AddCors(opt =>
 });
 
 var app = builder.Build();
+
+await EnsureOrderNicknameColumnAsync(app, app.Lifetime.ApplicationStopping);
+await EnsureAuditLogsTableAsync(app, app.Lifetime.ApplicationStopping);
+await EnsureAccountingLinksColumnsAsync(app, app.Lifetime.ApplicationStopping);
+await EnsureSystemAccountsColumnsAsync(app, app.Lifetime.ApplicationStopping);
+await EnsureSystemAccountsBootstrapAsync(app, app.Lifetime.ApplicationStopping);
 
 if (app.Environment.IsDevelopment())
 {
@@ -86,6 +95,31 @@ app.Use(async (ctx, next) =>
             TruncateForLog(requestBody),
             ctx.Response.StatusCode,
             TruncateForLog(responseBody));
+
+        if (ShouldWriteAuditLog(ctx.Request.Method, ctx.Request.Path))
+        {
+            try
+            {
+                var user = ctx.GetAuthedUser();
+                var audit = ctx.RequestServices.GetRequiredService<AuditService>();
+                await audit.WriteAuditLog(
+                    userId: user?.Id,
+                    username: user?.Username,
+                    role: user?.Role.DbValue(),
+                    method: ctx.Request.Method,
+                    path: path,
+                    statusCode: pipelineError is null
+                        ? ctx.Response.StatusCode
+                        : StatusCodes.Status500InternalServerError,
+                    requestBody: BuildAuditableBody(requestBody),
+                    responseBody: BuildAuditableBody(responseBody),
+                    ct: ctx.RequestAborted);
+            }
+            catch (Exception ex)
+            {
+                app.Logger.LogWarning(ex, "Failed to persist audit log for {Method} {Path}", ctx.Request.Method, path);
+            }
+        }
     }
 
     if (pipelineError is not null)
@@ -265,7 +299,7 @@ app.MapPost("/api/orders", async (HttpContext ctx, HttpRequest req, OrdersServic
 
 app.MapPost("/api/orders/merge", async (HttpContext ctx, HttpRequest req, OrdersService orders, CancellationToken ct) =>
 {
-    if (ctx.RequireMinRole(PosRole.Service, out _) is { } denied)
+    if (ctx.RequireMinRole(PosRole.Service, out var user) is { } denied)
     {
         return denied;
     }
@@ -276,7 +310,7 @@ app.MapPost("/api/orders/merge", async (HttpContext ctx, HttpRequest req, Orders
 
     try
     {
-        var result = await orders.MergeOrders(orderIds, targetOrderId, ct);
+        var result = await orders.MergeOrders(orderIds, user!.Id, targetOrderId, ct);
         return ApiResults.Ok(new { result = result.ToJson() });
     }
     catch (PosNotFoundException)
@@ -307,6 +341,28 @@ app.MapGet("/api/orders/{id:guid}", async (HttpContext ctx, Guid id, OrdersServi
     }
 
     return ApiResults.Ok(data);
+});
+
+app.MapDelete("/api/orders/{id:guid}", async (HttpContext ctx, Guid id, OrdersService orders, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Service, out var user) is { } denied)
+    {
+        return denied;
+    }
+
+    try
+    {
+        await orders.DiscardDraftOrder(id, user!.Id, ct);
+        return ApiResults.Ok(new { ok = true });
+    }
+    catch (PosNotFoundException)
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "NOT_FOUND", "Order not found");
+    }
+    catch (PosRuleException ex) when (ex.Code == "ORDER_NOT_DRAFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, ex.Code, "Only draft orders can be discarded");
+    }
 });
 
 app.MapPost("/api/orders/{id:guid}/items", async (HttpContext ctx, HttpRequest req, Guid id, OrdersService orders, CancellationToken ct) =>
@@ -371,7 +427,7 @@ app.MapPatch("/api/orders/items/{itemId:guid}", async (HttpContext ctx, HttpRequ
 
     try
     {
-        await orders.UpdateItem(itemId, patch, ct);
+        await orders.UpdateItem(itemId, user!.Id, patch, ct);
         return ApiResults.Ok(new { ok = true });
     }
     catch (PosNotFoundException)
@@ -429,7 +485,9 @@ app.MapPatch("/api/orders/{id:guid}", async (HttpContext ctx, HttpRequest req, G
         GetDouble(payload, "serviceFeeAmount"),
         GetDouble(payload, "serviceFeePercent"),
         payload.ContainsKey("isTakeaway"),
-        GetBool(payload, "isTakeaway"));
+        GetBool(payload, "isTakeaway"),
+        payload.ContainsKey("nickname"),
+        GetString(payload, "nickname"));
 
     try
     {
@@ -666,6 +724,28 @@ app.MapGet("/api/print/printers", async (HttpContext ctx, PrintService printServ
     return ApiResults.Ok(new { items });
 });
 
+app.MapGet("/api/settings/printers", async (HttpContext ctx, PrintService printService, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Cashier, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await printService.GetRuntimePrinterSettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapGet("/api/settings/cashier-expenses", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Cashier, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await admin.GetCashierExpenseSettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
 app.MapGet("/api/cashier/shifts/current", async (HttpContext ctx, ShiftsService shifts, CancellationToken ct) =>
 {
     if (ctx.RequireMinRole(PosRole.Cashier, out _) is { } denied)
@@ -674,6 +754,17 @@ app.MapGet("/api/cashier/shifts/current", async (HttpContext ctx, ShiftsService 
     }
 
     var item = await shifts.GetCurrentShiftSummary(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapGet("/api/cashier/shifts/current/orders", async (HttpContext ctx, OrdersService orders, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Cashier, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await orders.ListCurrentShiftOrdersHistory(ct);
     return ApiResults.Ok(new { item });
 });
 
@@ -757,6 +848,67 @@ app.MapGet("/api/cashier/shifts/{shiftId:guid}/summary.pdf", async (HttpContext 
     catch (Exception ex)
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "SHIFT_SUMMARY_FAILED", ex.Message);
+    }
+});
+
+app.MapGet("/api/cashier/expenses", async (HttpContext ctx, AccountingService accounting, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Cashier, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await accounting.GetCashierExpenseOverview(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapPost("/api/cashier/expenses", async (HttpContext ctx, HttpRequest req, AccountingService accounting, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Cashier, out var user) is { } denied)
+    {
+        return denied;
+    }
+
+    var payload = await ReadJsonMap(req, ct);
+    var category = GetString(payload, "category")?.Trim() ?? string.Empty;
+    var amount = GetDouble(payload, "amount");
+    var note = GetString(payload, "note")?.Trim();
+
+    if (string.IsNullOrWhiteSpace(category) || !amount.HasValue || amount.Value <= 0)
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "category and amount required");
+    }
+
+    try
+    {
+        var item = await accounting.CreateCashierExpense(
+            user!.Id,
+            category,
+            amount.Value,
+            ParseDateOnly(payload.TryGetValue("date", out var rawDate) ? GetElementAsString(rawDate) : null),
+            note,
+            ct);
+        return ApiResults.Ok(new { item }, StatusCodes.Status201Created);
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_REQUIRED")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_REQUIRED", "No open shift");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSES_DISABLED")
+    {
+        return ApiResults.Error(StatusCodes.Status403Forbidden, "CASHIER_EXPENSES_DISABLED", "Cashier expenses are disabled");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_CAP_EXCEEDED")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "CASHIER_EXPENSE_CAP_EXCEEDED", "Expense cap exceeded");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_CASH_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_CASH_ACCOUNT_NOT_FOUND", "Shift cash account is unavailable");
+    }
+    catch (Exception ex)
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "CREATE_FAILED", ex.Message);
     }
 });
 
@@ -922,10 +1074,11 @@ app.MapPut("/api/admin/settings/printers", async (HttpContext ctx, HttpRequest r
     var payload = await ReadJsonMap(req, ct);
     var receiptPrinterId = GetGuid(payload, "receiptPrinterId");
     var invoicePrinterId = GetGuid(payload, "invoicePrinterId");
+    var cashierDocumentsPrinterId = GetGuid(payload, "cashierDocumentsPrinterId");
 
     try
     {
-        var item = await admin.SetPrinterSettings(receiptPrinterId, invoicePrinterId, ct);
+        var item = await admin.SetPrinterSettings(receiptPrinterId, invoicePrinterId, cashierDocumentsPrinterId, ct);
         return ApiResults.Ok(new { item });
     }
     catch (InvalidOperationException ex) when (ex.Message == "RECEIPT_PRINTER_NOT_FOUND")
@@ -935,6 +1088,168 @@ app.MapPut("/api/admin/settings/printers", async (HttpContext ctx, HttpRequest r
     catch (InvalidOperationException ex) when (ex.Message == "INVOICE_PRINTER_NOT_FOUND")
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "INVOICE_PRINTER_NOT_FOUND", "Invoice printer not found or inactive");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_DOCS_PRINTER_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "CASHIER_DOCS_PRINTER_NOT_FOUND", "Cashier documents printer not found or inactive");
+    }
+});
+
+app.MapGet("/api/admin/settings/cashier-expenses", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await admin.GetCashierExpenseSettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapPut("/api/admin/settings/cashier-expenses", async (HttpContext ctx, HttpRequest req, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var payload = await ReadJsonMap(req, ct);
+    var enabledForCashier = GetBool(payload, "enabledForCashier");
+    var capAmount = GetDouble(payload, "capAmount");
+
+    try
+    {
+        var item = await admin.SetCashierExpenseSettings(enabledForCashier, capAmount, ct);
+        return ApiResults.Ok(new { item });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_CAP_INVALID")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "CASHIER_EXPENSE_CAP_INVALID", "capAmount must be greater than zero");
+    }
+    catch (Exception ex)
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", ex.Message);
+    }
+});
+
+app.MapGet("/api/admin/settings/invoice-template", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await admin.GetInvoiceTemplateSettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapPut("/api/admin/settings/invoice-template", async (HttpContext ctx, HttpRequest req, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var payload = await ReadJsonMap(req, ct);
+    var item = await admin.SetInvoiceTemplateSettings(
+        GetString(payload, "businessName"),
+        GetString(payload, "businessTagline"),
+        GetString(payload, "businessAddress"),
+        GetString(payload, "businessPhone"),
+        GetString(payload, "businessTaxNumber"),
+        GetString(payload, "headerNote"),
+        GetString(payload, "footerNote"),
+        GetString(payload, "invoiceTitleEn"),
+        GetString(payload, "invoiceTitleAr"),
+        GetString(payload, "receiptTitleEn"),
+        GetString(payload, "receiptTitleAr"),
+        GetString(payload, "primaryColorHex"),
+        GetString(payload, "accentColorHex"),
+        GetString(payload, "layoutVariant"),
+        GetBool(payload, "showLogo"),
+        GetBool(payload, "showPaymentsSection"),
+        ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapGet("/api/admin/settings/currencies", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await admin.GetCurrencySettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapGet("/api/settings/currencies", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Service, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await admin.GetCurrencySettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapGet("/api/settings/invoice-template", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Service, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await admin.GetInvoiceTemplateSettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapPut("/api/admin/settings/currencies", async (HttpContext ctx, HttpRequest req, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var payload = await ReadJsonMap(req, ct);
+    var defaultCurrencyCode = GetString(payload, "defaultCurrencyCode")?.Trim();
+    var currencies = payload.TryGetValue("currencies", out var currenciesEl) ? currenciesEl : default;
+
+    try
+    {
+        var item = await admin.SetCurrencySettings(defaultCurrencyCode, currencies, ct);
+        return ApiResults.Ok(new { item });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CURRENCIES_REQUIRED")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "CURRENCIES_REQUIRED", "At least one currency is required");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "DEFAULT_CURRENCY_REQUIRED")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "DEFAULT_CURRENCY_REQUIRED", "defaultCurrencyCode is required");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "DEFAULT_CURRENCY_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "DEFAULT_CURRENCY_NOT_FOUND", "defaultCurrencyCode must exist in currencies list");
+    }
+});
+
+app.MapGet("/api/admin/settings/currencies/rates", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    try
+    {
+        var item = await admin.GetCurrencyRates(ct);
+        return ApiResults.Ok(new { item });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "FX_PROVIDER_FAILED")
+    {
+        return ApiResults.Error(StatusCodes.Status502BadGateway, "FX_PROVIDER_FAILED", "Failed to fetch currency rates");
     }
 });
 
@@ -1541,6 +1856,7 @@ app.MapPost("/api/admin/employees", async (HttpContext ctx, HttpRequest req, Pay
     var payRate = GetDouble(payload, "payRate");
     var overtimeModifier = GetDouble(payload, "overtimeModifier") ?? 1.5;
     var overtimeThresholdHours = GetDouble(payload, "overtimeThresholdHours") ?? 8;
+    var accountPayload = GetObject(payload, "account");
 
     if (string.IsNullOrWhiteSpace(name) || !payRate.HasValue)
     {
@@ -1555,6 +1871,10 @@ app.MapPost("/api/admin/employees", async (HttpContext ctx, HttpRequest req, Pay
             overtimeModifier,
             overtimeThresholdHours,
             GetString(payload, "note"),
+            GetGuid(payload, "accountId"),
+            GetString(accountPayload, "name")?.Trim(),
+            GetString(accountPayload, "type")?.Trim(),
+            GetString(accountPayload, "currency")?.Trim(),
             ct);
 
         return ApiResults.Ok(new { item }, StatusCodes.Status201Created);
@@ -1571,6 +1891,14 @@ app.MapPost("/api/admin/employees", async (HttpContext ctx, HttpRequest req, Pay
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_OVERTIME_THRESHOLD", "overtimeThresholdHours must be between 0 and 24");
     }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_SELECTION")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_SELECTION", "Provide either accountId or account");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
+    }
     catch (InvalidOperationException ex) when (ex.Message == "CONFLICT")
     {
         return ApiResults.Error(StatusCodes.Status409Conflict, "CONFLICT", "Conflict");
@@ -1585,6 +1913,7 @@ app.MapPatch("/api/admin/employees/{id:guid}", async (HttpContext ctx, HttpReque
     }
 
     var payload = await ReadJsonMap(req, ct);
+    var accountPayload = GetObject(payload, "account");
     try
     {
         var item = await payroll.UpdateEmployee(
@@ -1595,6 +1924,11 @@ app.MapPatch("/api/admin/employees/{id:guid}", async (HttpContext ctx, HttpReque
             GetDouble(payload, "overtimeThresholdHours"),
             GetString(payload, "note"),
             payload.ContainsKey("note"),
+            GetGuid(payload, "accountId"),
+            payload.ContainsKey("accountId"),
+            GetString(accountPayload, "name")?.Trim(),
+            GetString(accountPayload, "type")?.Trim(),
+            GetString(accountPayload, "currency")?.Trim(),
             GetBool(payload, "isActive"),
             ct);
 
@@ -1616,6 +1950,14 @@ app.MapPatch("/api/admin/employees/{id:guid}", async (HttpContext ctx, HttpReque
     catch (InvalidOperationException ex) when (ex.Message == "BAD_OVERTIME_THRESHOLD")
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_OVERTIME_THRESHOLD", "overtimeThresholdHours must be between 0 and 24");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_SELECTION")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_SELECTION", "Provide either accountId or account");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
     }
     catch (InvalidOperationException ex) when (ex.Message == "CONFLICT")
     {
@@ -1814,6 +2156,8 @@ app.MapPost("/api/admin/accounts", async (HttpContext ctx, HttpRequest req, Acco
     var name = GetString(payload, "name")?.Trim() ?? string.Empty;
     var type = GetString(payload, "type")?.Trim() ?? "cash";
     var currency = GetString(payload, "currency")?.Trim() ?? "ILS";
+    var parentAccountId = GetGuid(payload, "parentAccountId");
+    var relations = ParseAccountRelations(payload.TryGetValue("relations", out var relEl) ? relEl : default);
     if (string.IsNullOrWhiteSpace(name))
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "name required");
@@ -1821,8 +2165,52 @@ app.MapPost("/api/admin/accounts", async (HttpContext ctx, HttpRequest req, Acco
 
     try
     {
-        var item = await accounting.CreateAccount(name, type, currency, ct);
+        var item = await accounting.CreateAccount(name, type, currency, parentAccountId, relations, ct);
         return ApiResults.Ok(new { item }, StatusCodes.Status201Created);
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "PARENT_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "PARENT_ACCOUNT_NOT_FOUND", "Parent account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_PARENT_SELF")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_PARENT_SELF", "Account cannot be its own parent");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_PARENT_CYCLE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_PARENT_CYCLE", "Parent assignment would create a cycle");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_RELATION")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_RELATION", "Each relation requires targetAccountId");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_RELATIONS_PAYLOAD")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_RELATIONS_PAYLOAD", "relations must be an array");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_RELATION_PERCENTAGE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_RELATION_PERCENTAGE", "percentage must be > 0 and <= 100");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_RELATION_SELF")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_RELATION_SELF", "Account cannot relate to itself");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_RELATION_DUPLICATE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_RELATION_DUPLICATE", "Duplicate relation target/kind");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_RELATION_PERCENTAGE_OVER_100")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_RELATION_PERCENTAGE_OVER_100", "Total percentage per kind cannot exceed 100");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "RELATION_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "RELATION_ACCOUNT_NOT_FOUND", "One or more related accounts not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts cannot be used in parent/relations");
     }
     catch (Exception ex)
     {
@@ -1838,6 +2226,10 @@ app.MapPatch("/api/admin/accounts/{id:guid}", async (HttpContext ctx, HttpReques
     }
 
     var payload = await ReadJsonMap(req, ct);
+    var parentAccountId = GetGuid(payload, "parentAccountId");
+    var hasParentAccountId = payload.ContainsKey("parentAccountId");
+    var relations = ParseAccountRelations(payload.TryGetValue("relations", out var relEl) ? relEl : default);
+    var hasRelations = payload.ContainsKey("relations");
     try
     {
         var item = await accounting.UpdateAccount(
@@ -1846,6 +2238,10 @@ app.MapPatch("/api/admin/accounts/{id:guid}", async (HttpContext ctx, HttpReques
             GetString(payload, "type")?.Trim(),
             GetString(payload, "currency")?.Trim(),
             GetBool(payload, "isActive"),
+            parentAccountId,
+            hasParentAccountId,
+            relations,
+            hasRelations,
             ct);
 
         if (item is null)
@@ -1855,9 +2251,57 @@ app.MapPatch("/api/admin/accounts/{id:guid}", async (HttpContext ctx, HttpReques
 
         return ApiResults.Ok(new { item });
     }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_LOCKED")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_LOCKED", "System base accounts cannot be edited");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "PARENT_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "PARENT_ACCOUNT_NOT_FOUND", "Parent account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_PARENT_SELF")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_PARENT_SELF", "Account cannot be its own parent");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_PARENT_CYCLE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_PARENT_CYCLE", "Parent assignment would create a cycle");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_RELATION")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_RELATION", "Each relation requires targetAccountId");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_RELATIONS_PAYLOAD")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_RELATIONS_PAYLOAD", "relations must be an array");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_RELATION_PERCENTAGE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_RELATION_PERCENTAGE", "percentage must be > 0 and <= 100");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_RELATION_SELF")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_RELATION_SELF", "Account cannot relate to itself");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_RELATION_DUPLICATE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_RELATION_DUPLICATE", "Duplicate relation target/kind");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_RELATION_PERCENTAGE_OVER_100")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_RELATION_PERCENTAGE_OVER_100", "Total percentage per kind cannot exceed 100");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "RELATION_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "RELATION_ACCOUNT_NOT_FOUND", "One or more related accounts not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts cannot be used in parent/relations");
+    }
     catch (Exception ex)
     {
-        return ApiResults.Error(StatusCodes.Status404NotFound, "NOT_FOUND", ex.Message);
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "UPDATE_FAILED", ex.Message);
     }
 });
 
@@ -1891,6 +2335,22 @@ app.MapPut("/api/admin/payment-method-accounts/{method}", async (HttpContext ctx
         var item = await accounting.SetPaymentMethodAccount(method, accountId.Value, ct);
         return ApiResults.Ok(new { item });
     }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_METHOD")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_METHOD", "Invalid payment method");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_INACTIVE", "Account is inactive");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts cannot be assigned manually");
+    }
     catch (Exception ex)
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "UPDATE_FAILED", ex.Message);
@@ -1916,6 +2376,7 @@ app.MapPost("/api/admin/suppliers", async (HttpContext ctx, HttpRequest req, Acc
     }
 
     var payload = await ReadJsonMap(req, ct);
+    var accountPayload = GetObject(payload, "account");
     var name = GetString(payload, "name")?.Trim() ?? string.Empty;
     if (string.IsNullOrWhiteSpace(name))
     {
@@ -1929,8 +2390,20 @@ app.MapPost("/api/admin/suppliers", async (HttpContext ctx, HttpRequest req, Acc
             GetString(payload, "phone")?.Trim(),
             GetString(payload, "email")?.Trim(),
             GetString(payload, "note")?.Trim(),
+            GetGuid(payload, "accountId"),
+            GetString(accountPayload, "name")?.Trim(),
+            GetString(accountPayload, "type")?.Trim(),
+            GetString(accountPayload, "currency")?.Trim(),
             ct);
         return ApiResults.Ok(new { item }, StatusCodes.Status201Created);
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_SELECTION")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_SELECTION", "Provide either accountId or account");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
     }
     catch (Exception ex)
     {
@@ -1946,6 +2419,7 @@ app.MapPatch("/api/admin/suppliers/{id:guid}", async (HttpContext ctx, HttpReque
     }
 
     var payload = await ReadJsonMap(req, ct);
+    var accountPayload = GetObject(payload, "account");
     try
     {
         var item = await accounting.UpdateSupplier(
@@ -1954,6 +2428,11 @@ app.MapPatch("/api/admin/suppliers/{id:guid}", async (HttpContext ctx, HttpReque
             GetString(payload, "phone")?.Trim(),
             GetString(payload, "email")?.Trim(),
             GetString(payload, "note")?.Trim(),
+            GetGuid(payload, "accountId"),
+            payload.ContainsKey("accountId"),
+            GetString(accountPayload, "name")?.Trim(),
+            GetString(accountPayload, "type")?.Trim(),
+            GetString(accountPayload, "currency")?.Trim(),
             GetBool(payload, "isActive"),
             ct);
 
@@ -1963,6 +2442,14 @@ app.MapPatch("/api/admin/suppliers/{id:guid}", async (HttpContext ctx, HttpReque
         }
 
         return ApiResults.Ok(new { item });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_ACCOUNT_SELECTION")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_ACCOUNT_SELECTION", "Provide either accountId or account");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
     }
     catch (Exception ex)
     {
@@ -2014,6 +2501,18 @@ app.MapPost("/api/admin/receipts", async (HttpContext ctx, HttpRequest req, Acco
             ct);
         return ApiResults.Ok(new { item }, StatusCodes.Status201Created);
     }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_INACTIVE", "Account is inactive");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts are managed automatically");
+    }
     catch (Exception ex)
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "CREATE_FAILED", ex.Message);
@@ -2045,10 +2544,16 @@ app.MapPost("/api/admin/expenses", async (HttpContext ctx, HttpRequest req, Acco
     var amount = GetDouble(payload, "amount");
     var method = GetString(payload, "method")?.Trim() ?? string.Empty;
     var accountId = GetGuid(payload, "accountId");
+    var supplierId = GetGuid(payload, "supplierId");
+    var employeeId = GetGuid(payload, "employeeId");
 
-    if (string.IsNullOrWhiteSpace(category) || !amount.HasValue || amount <= 0 || string.IsNullOrWhiteSpace(method) || !accountId.HasValue)
+    if (string.IsNullOrWhiteSpace(category) ||
+        !amount.HasValue ||
+        amount <= 0 ||
+        string.IsNullOrWhiteSpace(method) ||
+        (!accountId.HasValue && !supplierId.HasValue && !employeeId.HasValue))
     {
-        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "category, amount, method, accountId required");
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "category, amount, method and one of accountId/supplierId/employeeId required");
     }
 
     try
@@ -2058,13 +2563,42 @@ app.MapPost("/api/admin/expenses", async (HttpContext ctx, HttpRequest req, Acco
             category,
             amount.Value,
             method,
-            accountId.Value,
-            GetGuid(payload, "supplierId"),
+            accountId,
+            supplierId,
+            employeeId,
             ParseDateOnly(payload.TryGetValue("date", out var rawDate) ? GetElementAsString(rawDate) : null),
             GetString(payload, "attachmentUrl")?.Trim(),
             GetString(payload, "note")?.Trim(),
             ct);
         return ApiResults.Ok(new { item }, StatusCodes.Status201Created);
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_EXPENSE_TARGET")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_EXPENSE_TARGET", "Choose supplierId or employeeId, not both");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_REQUIRED")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "ACCOUNT_REQUIRED", "Selected source has no linked account");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_INACTIVE", "Account is inactive");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts are managed automatically");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SUPPLIER_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "SUPPLIER_NOT_FOUND", "Supplier not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "EMPLOYEE_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "EMPLOYEE_NOT_FOUND", "Employee not found");
     }
     catch (Exception ex)
     {
@@ -2092,6 +2626,18 @@ app.MapPost("/api/admin/vault/deposit", async (HttpContext ctx, HttpRequest req,
         await accounting.Deposit(user!.Id, accountId.Value, amount.Value, GetString(payload, "note")?.Trim(), ct);
         return ApiResults.Ok(new { ok = true });
     }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_INACTIVE", "Account is inactive");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts are managed automatically");
+    }
     catch (Exception ex)
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "DEPOSIT_FAILED", ex.Message);
@@ -2117,6 +2663,18 @@ app.MapPost("/api/admin/vault/withdraw", async (HttpContext ctx, HttpRequest req
     {
         await accounting.Withdraw(user!.Id, accountId.Value, amount.Value, GetString(payload, "note")?.Trim(), ct);
         return ApiResults.Ok(new { ok = true });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_INACTIVE", "Account is inactive");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts are managed automatically");
     }
     catch (Exception ex)
     {
@@ -2145,6 +2703,26 @@ app.MapPost("/api/admin/vault/transfer", async (HttpContext ctx, HttpRequest req
     {
         await accounting.Transfer(user!.Id, fromId.Value, toId.Value, amount.Value, GetString(payload, "note")?.Trim(), ct);
         return ApiResults.Ok(new { ok = true });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "TRANSFER_SAME_ACCOUNT")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "TRANSFER_SAME_ACCOUNT", "Source and destination accounts must be different");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "TRANSFER_CURRENCY_MISMATCH")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "TRANSFER_CURRENCY_MISMATCH", "Accounts must use the same currency");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "ACCOUNT_NOT_FOUND", "Account not found");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_INACTIVE", "Account is inactive");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "ACCOUNT_MANAGED_BY_SHIFT")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "ACCOUNT_MANAGED_BY_SHIFT", "Shift session accounts are managed automatically");
     }
     catch (Exception ex)
     {
@@ -2279,6 +2857,18 @@ app.MapDelete("/api/admin/print-queue/{id:guid}", async (HttpContext ctx, Guid i
     }
 });
 
+app.MapGet("/api/admin/audit-logs", async (HttpContext ctx, HttpRequest req, AuditService audit, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var limit = int.TryParse(req.Query["limit"], out var parsed) ? parsed : 200;
+    var items = await audit.ListAuditLogs(limit, ct);
+    return ApiResults.Ok(new { items });
+});
+
 app.MapMethods("/api/admin/{**path}", ["GET", "POST", "PATCH", "PUT", "DELETE"], (HttpContext ctx) =>
 {
     if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
@@ -2303,9 +2893,9 @@ static async Task<Dictionary<string, JsonElement>> ReadJsonMap(HttpRequest req, 
     return await req.ReadFromJsonAsync<Dictionary<string, JsonElement>>(cancellationToken: ct) ?? new Dictionary<string, JsonElement>();
 }
 
-static string? GetString(IReadOnlyDictionary<string, JsonElement> payload, string key)
+static string? GetString(IReadOnlyDictionary<string, JsonElement>? payload, string key)
 {
-    if (!payload.TryGetValue(key, out var value))
+    if (payload is null || !payload.TryGetValue(key, out var value))
     {
         return null;
     }
@@ -2388,6 +2978,22 @@ static Guid? GetGuid(IReadOnlyDictionary<string, JsonElement> payload, string ke
     return Guid.TryParse(raw, out var id) ? id : null;
 }
 
+static Dictionary<string, JsonElement>? GetObject(IReadOnlyDictionary<string, JsonElement> payload, string key)
+{
+    if (!payload.TryGetValue(key, out var value) || value.ValueKind != JsonValueKind.Object)
+    {
+        return null;
+    }
+
+    var map = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+    foreach (var prop in value.EnumerateObject())
+    {
+        map[prop.Name] = prop.Value;
+    }
+
+    return map;
+}
+
 static List<CustomizationSelection> ParseCustomizations(JsonElement el)
 {
     if (el.ValueKind != JsonValueKind.Array)
@@ -2448,6 +3054,45 @@ static List<Guid> ParseGuidList(JsonElement el)
         {
             outList.Add(id);
         }
+    }
+
+    return outList;
+}
+
+static List<AccountRelationInput> ParseAccountRelations(JsonElement el)
+{
+    if (el.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+    {
+        return [];
+    }
+
+    if (el.ValueKind != JsonValueKind.Array)
+    {
+        throw new InvalidOperationException("BAD_ACCOUNT_RELATIONS_PAYLOAD");
+    }
+
+    var outList = new List<AccountRelationInput>();
+    foreach (var row in el.EnumerateArray())
+    {
+        if (row.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("BAD_ACCOUNT_RELATION");
+        }
+
+        var targetRaw = GetElementAsString(row.TryGetProperty("targetAccountId", out var targetEl) ? targetEl : default);
+        if (!Guid.TryParse(targetRaw, out var targetAccountId))
+        {
+            throw new InvalidOperationException("BAD_ACCOUNT_RELATION");
+        }
+
+        var percentageRaw = GetElementAsString(row.TryGetProperty("percentage", out var pctEl) ? pctEl : default);
+        if (!decimal.TryParse(percentageRaw, out var percentage))
+        {
+            throw new InvalidOperationException("BAD_ACCOUNT_RELATION_PERCENTAGE");
+        }
+
+        var kind = GetElementAsString(row.TryGetProperty("kind", out var kindEl) ? kindEl : default);
+        outList.Add(new AccountRelationInput(targetAccountId, percentage, kind));
     }
 
     return outList;
@@ -2630,4 +3275,228 @@ static string TruncateForLog(string value, int max = 8192)
     }
 
     return $"{value[..max]}...(truncated {value.Length - max} chars)";
+}
+
+static bool ShouldWriteAuditLog(string method, PathString path)
+{
+    var rawPath = path.Value ?? string.Empty;
+
+    if (!rawPath.StartsWith("/api/admin", StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    if (rawPath.StartsWith("/api/admin/audit-logs", StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    return HttpMethods.IsPost(method)
+           || HttpMethods.IsPut(method)
+           || HttpMethods.IsPatch(method)
+           || HttpMethods.IsDelete(method);
+}
+
+static string? BuildAuditableBody(string value)
+{
+    if (string.IsNullOrWhiteSpace(value) || value == "<empty>")
+    {
+        return null;
+    }
+
+    if (value.StartsWith("<binary:", StringComparison.OrdinalIgnoreCase))
+    {
+        return value;
+    }
+
+    var redacted = RedactSensitiveJsonFields(value);
+    return TruncateForLog(redacted, 4000);
+}
+
+static string RedactSensitiveJsonFields(string raw)
+{
+    try
+    {
+        using var doc = JsonDocument.Parse(raw);
+        var redacted = RedactJsonElement(doc.RootElement);
+        return JsonSerializer.Serialize(redacted);
+    }
+    catch
+    {
+        return raw;
+    }
+}
+
+static object? RedactJsonElement(JsonElement element)
+{
+    return element.ValueKind switch
+    {
+        JsonValueKind.Object => RedactJsonObject(element),
+        JsonValueKind.Array => element.EnumerateArray().Select(RedactJsonElement).ToList(),
+        JsonValueKind.String => element.GetString(),
+        JsonValueKind.Number => element.ToString(),
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null => null,
+        JsonValueKind.Undefined => null,
+        _ => element.ToString(),
+    };
+}
+
+static Dictionary<string, object?> RedactJsonObject(JsonElement element)
+{
+    var map = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+    foreach (var prop in element.EnumerateObject())
+    {
+        if (IsSensitiveAuditField(prop.Name))
+        {
+            map[prop.Name] = "***";
+            continue;
+        }
+
+        map[prop.Name] = RedactJsonElement(prop.Value);
+    }
+
+    return map;
+}
+
+static bool IsSensitiveAuditField(string field)
+{
+    return field.Contains("password", StringComparison.OrdinalIgnoreCase)
+           || field.Contains("token", StringComparison.OrdinalIgnoreCase)
+           || field.Contains("secret", StringComparison.OrdinalIgnoreCase)
+           || field.Contains("pin", StringComparison.OrdinalIgnoreCase);
+}
+
+static async Task EnsureOrderNicknameColumnAsync(WebApplication app, CancellationToken ct)
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<PosDbContext>();
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        ALTER TABLE IF EXISTS pos_orders
+        ADD COLUMN IF NOT EXISTS nickname text;
+        """,
+        ct);
+}
+
+static async Task EnsureAuditLogsTableAsync(WebApplication app, CancellationToken ct)
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<PosDbContext>();
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        CREATE TABLE IF NOT EXISTS pos_audit_logs (
+            id uuid PRIMARY KEY,
+            user_id uuid NULL,
+            username text NULL,
+            role text NULL,
+            method text NOT NULL,
+            path text NOT NULL,
+            status_code integer NOT NULL,
+            request_body text NULL,
+            response_body text NULL,
+            created_at timestamp with time zone NOT NULL DEFAULT now()
+        );
+        """,
+        ct);
+
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        CREATE INDEX IF NOT EXISTS ix_pos_audit_logs_created_at
+        ON pos_audit_logs (created_at DESC);
+        """,
+        ct);
+}
+
+static async Task EnsureAccountingLinksColumnsAsync(WebApplication app, CancellationToken ct)
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<PosDbContext>();
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        ALTER TABLE IF EXISTS pos_suppliers
+        ADD COLUMN IF NOT EXISTS account_id uuid NULL;
+
+        ALTER TABLE IF EXISTS pos_employees
+        ADD COLUMN IF NOT EXISTS account_id uuid NULL;
+
+        ALTER TABLE IF EXISTS pos_expenses
+        ADD COLUMN IF NOT EXISTS employee_id uuid NULL;
+        """,
+        ct);
+}
+
+static async Task EnsureSystemAccountsColumnsAsync(WebApplication app, CancellationToken ct)
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<PosDbContext>();
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        ALTER TABLE IF EXISTS pos_accounts
+        ADD COLUMN IF NOT EXISTS account_scope text NOT NULL DEFAULT 'custom';
+
+        ALTER TABLE IF EXISTS pos_accounts
+        ADD COLUMN IF NOT EXISTS account_key text NULL;
+
+        ALTER TABLE IF EXISTS pos_accounts
+        ADD COLUMN IF NOT EXISTS is_system boolean NOT NULL DEFAULT false;
+
+        ALTER TABLE IF EXISTS pos_accounts
+        ADD COLUMN IF NOT EXISTS is_locked boolean NOT NULL DEFAULT false;
+
+        ALTER TABLE IF EXISTS pos_accounts
+        ADD COLUMN IF NOT EXISTS shift_id uuid NULL;
+
+        ALTER TABLE IF EXISTS pos_accounts
+        ADD COLUMN IF NOT EXISTS base_account_id uuid NULL;
+
+        ALTER TABLE IF EXISTS pos_accounts
+        ADD COLUMN IF NOT EXISTS parent_account_id uuid NULL;
+        """,
+        ct);
+
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        CREATE INDEX IF NOT EXISTS ix_pos_accounts_scope_key
+        ON pos_accounts (account_scope, account_key);
+
+        CREATE INDEX IF NOT EXISTS ix_pos_accounts_shift_id
+        ON pos_accounts (shift_id);
+
+        CREATE INDEX IF NOT EXISTS ix_pos_accounts_parent_account_id
+        ON pos_accounts (parent_account_id);
+        """,
+        ct);
+
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        CREATE TABLE IF NOT EXISTS pos_account_relations (
+            id uuid PRIMARY KEY,
+            from_account_id uuid NOT NULL,
+            to_account_id uuid NOT NULL,
+            percentage numeric(5,2) NOT NULL,
+            kind text NOT NULL DEFAULT 'allocation',
+            created_at timestamp with time zone NOT NULL DEFAULT now()
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_pos_account_relations_from_account_id
+        ON pos_account_relations (from_account_id);
+
+        CREATE INDEX IF NOT EXISTS ix_pos_account_relations_to_account_id
+        ON pos_account_relations (to_account_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_pos_account_relations_from_to_kind
+        ON pos_account_relations (from_account_id, to_account_id, kind);
+        """,
+        ct);
+}
+
+static async Task EnsureSystemAccountsBootstrapAsync(WebApplication app, CancellationToken ct)
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    var systemAccounts = scope.ServiceProvider.GetRequiredService<SystemAccountsService>();
+    await systemAccounts.EnsureVaultBaseAccounts(DateTime.UtcNow, ct);
+    var db = scope.ServiceProvider.GetRequiredService<PosDbContext>();
+    await db.SaveChangesAsync(ct);
 }

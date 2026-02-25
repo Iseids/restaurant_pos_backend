@@ -1,16 +1,21 @@
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using ResPosBackend.Data;
+using ResPosBackend.Infrastructure;
 using ResPosBackend.Models;
 
 namespace ResPosBackend.Services;
 
 public sealed class AccountingService(PosDbContext db)
 {
+    private sealed record CashierExpenseSettingsSnapshot(bool EnabledForCashier, decimal? CapAmount);
+
     public async Task<List<object>> ListAccounts(CancellationToken ct)
     {
         var rows = await (
             from a in db.Accounts.AsNoTracking()
+            join parent in db.Accounts.AsNoTracking() on a.ParentAccountId equals parent.Id into parentJoin
+            from parent in parentJoin.DefaultIfEmpty()
             join t in db.AccountTransactions.AsNoTracking() on a.Id equals t.AccountId into txs
             orderby a.CreatedAt
             select new
@@ -20,6 +25,14 @@ public sealed class AccountingService(PosDbContext db)
                 a.Type,
                 a.Currency,
                 a.IsActive,
+                a.IsSystem,
+                a.IsLocked,
+                a.AccountScope,
+                a.AccountKey,
+                a.ShiftId,
+                a.BaseAccountId,
+                a.ParentAccountId,
+                ParentAccountName = parent != null ? parent.Name : null,
                 a.CreatedAt,
                 Balance = txs
                     .Sum(x => x.Direction == "in"
@@ -28,6 +41,43 @@ public sealed class AccountingService(PosDbContext db)
             })
             .ToListAsync(ct);
 
+        var accountIds = rows.Select(x => x.Id).ToList();
+        var outgoingRelations = accountIds.Count == 0
+            ? []
+            : await (
+                from rel in db.AccountRelations.AsNoTracking()
+                join target in db.Accounts.AsNoTracking() on rel.ToAccountId equals target.Id into targetJoin
+                from target in targetJoin.DefaultIfEmpty()
+                where accountIds.Contains(rel.FromAccountId)
+                select new
+                {
+                    rel.FromAccountId,
+                    rel.ToAccountId,
+                    TargetAccountName = target != null ? target.Name : null,
+                    rel.Percentage,
+                    rel.Kind,
+                }).ToListAsync(ct);
+
+        var outgoingByFromAccount = outgoingRelations
+            .GroupBy(x => x.FromAccountId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => (object)new
+                {
+                    targetAccountId = x.ToAccountId,
+                    targetAccountName = x.TargetAccountName,
+                    percentage = (double)x.Percentage,
+                    kind = x.Kind,
+                }).ToList());
+
+        var subAccountCounts = accountIds.Count == 0
+            ? new Dictionary<Guid, int>()
+            : await db.Accounts.AsNoTracking()
+                .Where(x => x.ParentAccountId.HasValue && accountIds.Contains(x.ParentAccountId.Value))
+                .GroupBy(x => x.ParentAccountId!.Value)
+                .Select(g => new { ParentAccountId = g.Key, Count = g.Count() })
+                .ToDictionaryAsync(x => x.ParentAccountId, x => x.Count, ct);
+
         return rows.Select(x => (object)new
         {
             id = x.Id,
@@ -35,44 +85,90 @@ public sealed class AccountingService(PosDbContext db)
             type = x.Type,
             currency = x.Currency,
             isActive = x.IsActive,
+            isSystem = x.IsSystem,
+            isLocked = x.IsLocked,
+            accountScope = x.AccountScope,
+            accountKey = x.AccountKey,
+            shiftId = x.ShiftId,
+            baseAccountId = x.BaseAccountId,
+            parentAccountId = x.ParentAccountId,
+            parentAccountName = x.ParentAccountName,
             createdAt = x.CreatedAt,
             balance = (double)x.Balance,
+            subAccountsCount = subAccountCounts.TryGetValue(x.Id, out var count) ? count : 0,
+            relations = outgoingByFromAccount.TryGetValue(x.Id, out var rels) ? rels : new List<object>(),
         }).ToList();
     }
 
-    public async Task<object> CreateAccount(string name, string type, string currency, CancellationToken ct)
+    public async Task<object> CreateAccount(
+        string name,
+        string type,
+        string currency,
+        Guid? parentAccountId,
+        IReadOnlyList<AccountRelationInput>? relations,
+        CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        var accountId = Guid.NewGuid();
+        await ValidateParentAssignment(accountId, parentAccountId, ct);
+
         var entity = new PosAccount
         {
-            Id = Guid.NewGuid(),
+            Id = accountId,
             Name = name,
             Type = string.IsNullOrWhiteSpace(type) ? "cash" : type,
             Currency = string.IsNullOrWhiteSpace(currency) ? "ILS" : currency,
             IsActive = true,
+            AccountScope = "custom",
+            AccountKey = null,
+            IsSystem = false,
+            IsLocked = false,
+            ShiftId = null,
+            BaseAccountId = null,
+            ParentAccountId = parentAccountId,
             CreatedAt = DateTime.UtcNow,
         };
 
         db.Accounts.Add(entity);
         await SaveWithConflictHandling(ct);
 
-        return new
+        await ReplaceAccountRelations(entity.Id, relations ?? [], ct);
+        await SaveWithConflictHandling(ct);
+        await tx.CommitAsync(ct);
+
+        var item = await BuildAccountView(entity.Id, ct);
+        if (item is null)
         {
-            id = entity.Id,
-            name = entity.Name,
-            type = entity.Type,
-            currency = entity.Currency,
-            isActive = entity.IsActive,
-            createdAt = entity.CreatedAt,
-            balance = 0d,
-        };
+            throw new InvalidOperationException("ACCOUNT_NOT_FOUND");
+        }
+
+        return item;
     }
 
-    public async Task<object?> UpdateAccount(Guid id, string? name, string? type, string? currency, bool? isActive, CancellationToken ct)
+    public async Task<object?> UpdateAccount(
+        Guid id,
+        string? name,
+        string? type,
+        string? currency,
+        bool? isActive,
+        Guid? parentAccountId,
+        bool hasParentAccountId,
+        IReadOnlyList<AccountRelationInput>? relations,
+        bool hasRelations,
+        CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
         var entity = await db.Accounts.FirstOrDefaultAsync(x => x.Id == id, ct);
         if (entity is null)
         {
             return null;
+        }
+
+        if (entity.IsSystem && entity.IsLocked)
+        {
+            throw new InvalidOperationException("ACCOUNT_LOCKED");
         }
 
         if (!string.IsNullOrWhiteSpace(name))
@@ -95,18 +191,22 @@ public sealed class AccountingService(PosDbContext db)
             entity.IsActive = isActive.Value;
         }
 
+        if (hasParentAccountId)
+        {
+            await ValidateParentAssignment(entity.Id, parentAccountId, ct);
+            entity.ParentAccountId = parentAccountId;
+        }
+
         await SaveWithConflictHandling(ct);
 
-        return new
+        if (hasRelations)
         {
-            id = entity.Id,
-            name = entity.Name,
-            type = entity.Type,
-            currency = entity.Currency,
-            isActive = entity.IsActive,
-            createdAt = entity.CreatedAt,
-            balance = 0d,
-        };
+            await ReplaceAccountRelations(entity.Id, relations ?? [], ct);
+            await SaveWithConflictHandling(ct);
+        }
+
+        await tx.CommitAsync(ct);
+        return await BuildAccountView(entity.Id, ct);
     }
 
     public async Task<List<object>> ListPaymentMethodAccounts(CancellationToken ct)
@@ -136,12 +236,20 @@ public sealed class AccountingService(PosDbContext db)
 
     public async Task<object> SetPaymentMethodAccount(string method, Guid accountId, CancellationToken ct)
     {
-        var existing = await db.PaymentMethodAccounts.FirstOrDefaultAsync(x => x.Method == method, ct);
+        var normalizedMethod = SystemAccountsService.NormalizeMethod(method);
+        if (string.IsNullOrWhiteSpace(normalizedMethod))
+        {
+            throw new InvalidOperationException("BAD_METHOD");
+        }
+
+        var account = await GetActiveManualAccountForOperations(accountId, ct);
+
+        var existing = await db.PaymentMethodAccounts.FirstOrDefaultAsync(x => x.Method == normalizedMethod, ct);
         if (existing is null)
         {
             db.PaymentMethodAccounts.Add(new PosPaymentMethodAccount
             {
-                Method = method,
+                Method = normalizedMethod,
                 AccountId = accountId,
             });
         }
@@ -155,7 +263,7 @@ public sealed class AccountingService(PosDbContext db)
         var row = await (
             from map in db.PaymentMethodAccounts.AsNoTracking()
             join acc in db.Accounts.AsNoTracking() on map.AccountId equals acc.Id
-            where map.Method == method
+            where map.Method == normalizedMethod
             select new
             {
                 map.Method,
@@ -177,7 +285,26 @@ public sealed class AccountingService(PosDbContext db)
 
     public async Task<List<object>> ListSuppliers(CancellationToken ct)
     {
-        var items = await db.Suppliers.AsNoTracking().OrderBy(x => x.Name).ToListAsync(ct);
+        var items = await (
+            from s in db.Suppliers.AsNoTracking()
+            join a in db.Accounts.AsNoTracking() on s.AccountId equals a.Id into aJoin
+            from a in aJoin.DefaultIfEmpty()
+            orderby s.Name
+            select new
+            {
+                s.Id,
+                s.Name,
+                s.Phone,
+                s.Email,
+                s.Note,
+                s.AccountId,
+                AccountName = a != null ? a.Name : null,
+                AccountType = a != null ? a.Type : null,
+                AccountCurrency = a != null ? a.Currency : null,
+                s.IsActive,
+                s.CreatedAt,
+            }).ToListAsync(ct);
+
         return items.Select(x => (object)new
         {
             id = x.Id,
@@ -185,13 +312,34 @@ public sealed class AccountingService(PosDbContext db)
             phone = x.Phone,
             email = x.Email,
             note = x.Note,
+            accountId = x.AccountId,
+            accountName = x.AccountName,
+            accountType = x.AccountType,
+            accountCurrency = x.AccountCurrency,
             isActive = x.IsActive,
             createdAt = x.CreatedAt,
         }).ToList();
     }
 
-    public async Task<object> CreateSupplier(string name, string? phone, string? email, string? note, CancellationToken ct)
+    public async Task<object> CreateSupplier(
+        string name,
+        string? phone,
+        string? email,
+        string? note,
+        Guid? accountId,
+        string? createAccountName,
+        string? createAccountType,
+        string? createAccountCurrency,
+        CancellationToken ct)
     {
+        var resolvedAccountId = await ResolveOrCreateAccountId(
+            accountId,
+            createAccountName,
+            createAccountType,
+            createAccountCurrency,
+            "supplier",
+            ct);
+
         var entity = new PosSupplier
         {
             Id = Guid.NewGuid(),
@@ -199,12 +347,17 @@ public sealed class AccountingService(PosDbContext db)
             Phone = string.IsNullOrWhiteSpace(phone) ? null : phone.Trim(),
             Email = string.IsNullOrWhiteSpace(email) ? null : email.Trim(),
             Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim(),
+            AccountId = resolvedAccountId,
             IsActive = true,
             CreatedAt = DateTime.UtcNow,
         };
 
         db.Suppliers.Add(entity);
         await SaveWithConflictHandling(ct);
+
+        var account = entity.AccountId.HasValue
+            ? await db.Accounts.AsNoTracking().FirstOrDefaultAsync(x => x.Id == entity.AccountId.Value, ct)
+            : null;
 
         return new
         {
@@ -213,6 +366,10 @@ public sealed class AccountingService(PosDbContext db)
             phone = entity.Phone,
             email = entity.Email,
             note = entity.Note,
+            accountId = entity.AccountId,
+            accountName = account?.Name,
+            accountType = account?.Type,
+            accountCurrency = account?.Currency,
             isActive = entity.IsActive,
             createdAt = entity.CreatedAt,
         };
@@ -224,6 +381,11 @@ public sealed class AccountingService(PosDbContext db)
         string? phone,
         string? email,
         string? note,
+        Guid? accountId,
+        bool hasAccountId,
+        string? createAccountName,
+        string? createAccountType,
+        string? createAccountCurrency,
         bool? isActive,
         CancellationToken ct)
     {
@@ -253,12 +415,40 @@ public sealed class AccountingService(PosDbContext db)
             entity.Note = note.Trim();
         }
 
+        if (!string.IsNullOrWhiteSpace(createAccountName))
+        {
+            entity.AccountId = await ResolveOrCreateAccountId(
+                null,
+                createAccountName,
+                createAccountType,
+                createAccountCurrency,
+                "supplier",
+                ct);
+        }
+        else if (hasAccountId)
+        {
+            if (accountId.HasValue)
+            {
+                var accountExists = await db.Accounts.AsNoTracking().AnyAsync(x => x.Id == accountId.Value, ct);
+                if (!accountExists)
+                {
+                    throw new InvalidOperationException("ACCOUNT_NOT_FOUND");
+                }
+            }
+
+            entity.AccountId = accountId;
+        }
+
         if (isActive.HasValue)
         {
             entity.IsActive = isActive.Value;
         }
 
         await SaveWithConflictHandling(ct);
+
+        var account = entity.AccountId.HasValue
+            ? await db.Accounts.AsNoTracking().FirstOrDefaultAsync(x => x.Id == entity.AccountId.Value, ct)
+            : null;
 
         return new
         {
@@ -267,6 +457,10 @@ public sealed class AccountingService(PosDbContext db)
             phone = entity.Phone,
             email = entity.Email,
             note = entity.Note,
+            accountId = entity.AccountId,
+            accountName = account?.Name,
+            accountType = account?.Type,
+            accountCurrency = account?.Currency,
             isActive = entity.IsActive,
             createdAt = entity.CreatedAt,
         };
@@ -283,6 +477,7 @@ public sealed class AccountingService(PosDbContext db)
         string? note,
         CancellationToken ct)
     {
+        await GetActiveManualAccountForOperations(accountId, ct);
         await using var tx = await db.Database.BeginTransactionAsync(ct);
 
         var now = DateTime.UtcNow;
@@ -335,13 +530,21 @@ public sealed class AccountingService(PosDbContext db)
         string category,
         double amount,
         string method,
-        Guid accountId,
+        Guid? accountId,
         Guid? supplierId,
+        Guid? employeeId,
         DateOnly? expenseDate,
         string? attachmentUrl,
         string? note,
         CancellationToken ct)
     {
+        var resolvedAccountId = await ResolveReferenceAccountId(accountId, supplierId, employeeId, ct);
+        if (!resolvedAccountId.HasValue)
+        {
+            throw new InvalidOperationException("ACCOUNT_REQUIRED");
+        }
+        await GetActiveManualAccountForOperations(resolvedAccountId.Value, ct);
+
         await using var tx = await db.Database.BeginTransactionAsync(ct);
 
         var now = DateTime.UtcNow;
@@ -351,9 +554,10 @@ public sealed class AccountingService(PosDbContext db)
             ExpenseDate = expenseDate ?? DateOnly.FromDateTime(now),
             Category = category,
             SupplierId = supplierId,
+            EmployeeId = employeeId,
             Amount = (decimal)amount,
             Method = method,
-            AccountId = accountId,
+            AccountId = resolvedAccountId,
             AttachmentUrl = string.IsNullOrWhiteSpace(attachmentUrl) ? null : attachmentUrl.Trim(),
             Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim(),
             CreatedBy = createdBy,
@@ -366,7 +570,7 @@ public sealed class AccountingService(PosDbContext db)
         db.AccountTransactions.Add(new PosAccountTransaction
         {
             Id = Guid.NewGuid(),
-            AccountId = accountId,
+            AccountId = resolvedAccountId.Value,
             Direction = "out",
             Amount = (decimal)amount,
             SourceType = "expense",
@@ -386,12 +590,209 @@ public sealed class AccountingService(PosDbContext db)
             amount = (double)entity.Amount,
             method = entity.Method,
             accountId = entity.AccountId,
+            supplierId = entity.SupplierId,
+            employeeId = entity.EmployeeId,
             createdAt = entity.CreatedAt,
+        };
+    }
+
+    public async Task<object> GetCashierExpenseOverview(CancellationToken ct)
+    {
+        var settings = await LoadCashierExpenseSettings(ct);
+
+        var shift = await db.Shifts
+            .AsNoTracking()
+            .OrderByDescending(x => x.OpenedAt)
+            .FirstOrDefaultAsync(x => x.ClosedAt == null, ct);
+
+        if (shift is null)
+        {
+            return new
+            {
+                enabledForCashier = settings.EnabledForCashier,
+                capAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
+                spentAmount = 0d,
+                remainingAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
+                shift = (object?)null,
+                items = Array.Empty<object>(),
+            };
+        }
+
+        var shiftCashAccount = await db.Accounts
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x =>
+                x.AccountScope == SystemAccountsService.ShiftSessionScope &&
+                x.ShiftId == shift.Id &&
+                x.AccountKey == "cash",
+                ct);
+
+        decimal spent = 0m;
+        var expenses = new List<object>();
+        if (shiftCashAccount is not null)
+        {
+            spent = await db.AccountTransactions
+                .AsNoTracking()
+                .Where(x =>
+                    x.AccountId == shiftCashAccount.Id &&
+                    x.SourceType == "cashier_expense" &&
+                    x.Direction == "out")
+                .Select(x => (decimal?)x.Amount)
+                .SumAsync(ct) ?? 0m;
+
+            var rows = await db.Expenses
+                .AsNoTracking()
+                .Where(x =>
+                    x.AccountId == shiftCashAccount.Id &&
+                    x.CreatedAt >= shift.OpenedAt)
+                .OrderByDescending(x => x.CreatedAt)
+                .Take(200)
+                .ToListAsync(ct);
+
+            expenses = rows.Select(x => (object)new
+            {
+                id = x.Id,
+                date = x.ExpenseDate.ToString("yyyy-MM-dd"),
+                category = x.Category,
+                amount = (double)x.Amount,
+                method = x.Method,
+                accountId = x.AccountId,
+                note = x.Note,
+                createdAt = x.CreatedAt,
+            }).ToList();
+        }
+
+        var remaining = settings.CapAmount.HasValue
+            ? Math.Max(0m, settings.CapAmount.Value - spent)
+            : (decimal?)null;
+
+        return new
+        {
+            enabledForCashier = settings.EnabledForCashier,
+            capAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
+            spentAmount = (double)spent,
+            remainingAmount = remaining is null ? null : (double?)remaining.Value,
+            shift = new
+            {
+                id = shift.Id,
+                openedAt = shift.OpenedAt,
+                openedBy = shift.OpenedBy,
+                cashAccountId = shiftCashAccount?.Id,
+                cashAccountName = shiftCashAccount?.Name,
+            },
+            items = expenses,
+        };
+    }
+
+    public async Task<object> CreateCashierExpense(
+        Guid createdBy,
+        string category,
+        double amount,
+        DateOnly? expenseDate,
+        string? note,
+        CancellationToken ct)
+    {
+        var settings = await LoadCashierExpenseSettings(ct);
+        if (!settings.EnabledForCashier)
+        {
+            throw new InvalidOperationException("CASHIER_EXPENSES_DISABLED");
+        }
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        var shift = await db.Shifts
+            .OrderByDescending(x => x.OpenedAt)
+            .FirstOrDefaultAsync(x => x.ClosedAt == null, ct);
+        if (shift is null)
+        {
+            throw new InvalidOperationException("SHIFT_REQUIRED");
+        }
+
+        var shiftCashAccount = await db.Accounts
+            .FirstOrDefaultAsync(x =>
+                x.AccountScope == SystemAccountsService.ShiftSessionScope &&
+                x.ShiftId == shift.Id &&
+                x.AccountKey == "cash" &&
+                x.IsActive,
+                ct);
+        if (shiftCashAccount is null)
+        {
+            throw new InvalidOperationException("SHIFT_CASH_ACCOUNT_NOT_FOUND");
+        }
+
+        var requestedAmount = decimal.Round((decimal)amount, 2, MidpointRounding.AwayFromZero);
+        var spent = await db.AccountTransactions
+            .Where(x =>
+                x.AccountId == shiftCashAccount.Id &&
+                x.SourceType == "cashier_expense" &&
+                x.Direction == "out")
+            .Select(x => (decimal?)x.Amount)
+            .SumAsync(ct) ?? 0m;
+
+        if (settings.CapAmount.HasValue && spent + requestedAmount > settings.CapAmount.Value + 0.0001m)
+        {
+            throw new InvalidOperationException("CASHIER_EXPENSE_CAP_EXCEEDED");
+        }
+
+        var now = DateTime.UtcNow;
+        var entity = new PosExpense
+        {
+            Id = Guid.NewGuid(),
+            ExpenseDate = expenseDate ?? DateOnly.FromDateTime(now),
+            Category = category,
+            SupplierId = null,
+            EmployeeId = null,
+            Amount = requestedAmount,
+            Method = "cash",
+            AccountId = shiftCashAccount.Id,
+            AttachmentUrl = null,
+            Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim(),
+            CreatedBy = createdBy,
+            CreatedAt = now,
+        };
+
+        db.Expenses.Add(entity);
+        await db.SaveChangesAsync(ct);
+
+        db.AccountTransactions.Add(new PosAccountTransaction
+        {
+            Id = Guid.NewGuid(),
+            AccountId = shiftCashAccount.Id,
+            Direction = "out",
+            Amount = requestedAmount,
+            SourceType = "cashier_expense",
+            SourceId = entity.Id,
+            Note = entity.Note ?? "Cashier expense",
+            CreatedBy = createdBy,
+            CreatedAt = now,
+        });
+
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        var spentAfter = spent + requestedAmount;
+        var remainingAfter = settings.CapAmount.HasValue
+            ? Math.Max(0m, settings.CapAmount.Value - spentAfter)
+            : (decimal?)null;
+
+        return new
+        {
+            id = entity.Id,
+            date = entity.ExpenseDate.ToString("yyyy-MM-dd"),
+            category = entity.Category,
+            amount = (double)entity.Amount,
+            method = entity.Method,
+            accountId = entity.AccountId,
+            note = entity.Note,
+            createdAt = entity.CreatedAt,
+            capAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
+            spentAmount = (double)spentAfter,
+            remainingAmount = remainingAfter is null ? null : (double?)remainingAfter.Value,
         };
     }
 
     public async Task Deposit(Guid createdBy, Guid accountId, double amount, string? note, CancellationToken ct)
     {
+        await GetActiveManualAccountForOperations(accountId, ct);
         db.AccountTransactions.Add(new PosAccountTransaction
         {
             Id = Guid.NewGuid(),
@@ -410,6 +811,7 @@ public sealed class AccountingService(PosDbContext db)
 
     public async Task Withdraw(Guid createdBy, Guid accountId, double amount, string? note, CancellationToken ct)
     {
+        await GetActiveManualAccountForOperations(accountId, ct);
         db.AccountTransactions.Add(new PosAccountTransaction
         {
             Id = Guid.NewGuid(),
@@ -431,6 +833,13 @@ public sealed class AccountingService(PosDbContext db)
         if (fromAccountId == toAccountId)
         {
             throw new InvalidOperationException("TRANSFER_SAME_ACCOUNT");
+        }
+
+        var fromAccount = await GetActiveManualAccountForOperations(fromAccountId, ct);
+        var toAccount = await GetActiveManualAccountForOperations(toAccountId, ct);
+        if (!string.Equals(fromAccount.Currency, toAccount.Currency, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("TRANSFER_CURRENCY_MISMATCH");
         }
 
         await using var tx = await db.Database.BeginTransactionAsync(ct);
@@ -486,27 +895,65 @@ public sealed class AccountingService(PosDbContext db)
             join o in db.Orders.AsNoTracking() on p.OrderId equals o.Id
             join t in db.Tables.AsNoTracking() on o.TableId equals t.Id into tJoin
             from t in tJoin.DefaultIfEmpty()
-            join map in db.PaymentMethodAccounts.AsNoTracking() on p.Method equals map.Method into mapJoin
-            from map in mapJoin.DefaultIfEmpty()
-            join a in db.Accounts.AsNoTracking() on map.AccountId equals a.Id into aJoin
-            from a in aJoin.DefaultIfEmpty()
             where (!start.HasValue || o.BusinessDate >= start.Value)
                   && (!end.HasValue || o.BusinessDate <= end.Value)
             select new
             {
-                Kind = "pos",
-                Id = p.Id,
+                PaymentId = p.Id,
                 Date = o.BusinessDate,
                 Amount = p.Amount,
                 Method = p.Method,
-                Source = (string?)null,
-                SupplierName = (string?)null,
-                AccountName = a != null ? a.Name : null,
                 OrderNo = (short?)o.OrderNo,
                 IsTakeaway = (bool?)o.IsTakeaway,
                 TableName = t != null ? t.Name : null,
                 CreatedAt = p.CreatedAt,
             }).ToListAsync(ct);
+
+        var txAccountByPaymentId = new Dictionary<Guid, Guid>();
+        if (posRows.Count > 0)
+        {
+            var paymentIds = posRows.Select(x => x.PaymentId).ToList();
+            var txRows = await db.AccountTransactions
+                .AsNoTracking()
+                .Where(x => x.SourceType == "pos_payment" && x.SourceId.HasValue && paymentIds.Contains(x.SourceId.Value))
+                .OrderByDescending(x => x.CreatedAt)
+                .Select(x => new
+                {
+                    SourceId = x.SourceId!.Value,
+                    x.AccountId,
+                })
+                .ToListAsync(ct);
+
+            txAccountByPaymentId = txRows
+                .GroupBy(x => x.SourceId)
+                .ToDictionary(x => x.Key, x => x.First().AccountId);
+        }
+
+        var accountNameById = txAccountByPaymentId.Count == 0
+            ? new Dictionary<Guid, string>()
+            : await db.Accounts
+                .AsNoTracking()
+                .Where(x => txAccountByPaymentId.Values.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => x.Name, ct);
+
+        var posPayload = posRows.Select(x => new
+        {
+            Kind = "pos",
+            Id = x.PaymentId,
+            Date = x.Date,
+            Amount = x.Amount,
+            Method = x.Method,
+            Source = (string?)null,
+            SupplierName = (string?)null,
+            AccountName = txAccountByPaymentId.TryGetValue(x.PaymentId, out var accountId) &&
+                          accountNameById.TryGetValue(accountId, out var accountName)
+                ? accountName
+                : null,
+            OrderNo = x.OrderNo,
+            IsTakeaway = x.IsTakeaway,
+            TableName = x.TableName,
+            CreatedAt = x.CreatedAt,
+        });
 
         var manualRows = await (
             from r in db.Receipts.AsNoTracking()
@@ -532,7 +979,7 @@ public sealed class AccountingService(PosDbContext db)
                 CreatedAt = r.CreatedAt,
             }).ToListAsync(ct);
 
-        var rows = posRows
+        var rows = posPayload
             .Concat(manualRows)
             .OrderByDescending(x => x.CreatedAt)
             .ToList();
@@ -560,6 +1007,8 @@ public sealed class AccountingService(PosDbContext db)
             from e in db.Expenses.AsNoTracking()
             join s in db.Suppliers.AsNoTracking() on e.SupplierId equals s.Id into sJoin
             from s in sJoin.DefaultIfEmpty()
+            join emp in db.Employees.AsNoTracking() on e.EmployeeId equals emp.Id into empJoin
+            from emp in empJoin.DefaultIfEmpty()
             join a in db.Accounts.AsNoTracking() on e.AccountId equals a.Id into aJoin
             from a in aJoin.DefaultIfEmpty()
             where (!start.HasValue || e.ExpenseDate >= start.Value)
@@ -572,7 +1021,11 @@ public sealed class AccountingService(PosDbContext db)
                 e.Category,
                 e.Amount,
                 e.Method,
+                e.SupplierId,
+                e.EmployeeId,
+                e.AccountId,
                 SupplierName = s != null ? s.Name : null,
+                EmployeeName = emp != null ? emp.Name : null,
                 AccountName = a != null ? a.Name : null,
                 e.AttachmentUrl,
                 e.Note,
@@ -586,7 +1039,11 @@ public sealed class AccountingService(PosDbContext db)
             category = x.Category,
             amount = (double)x.Amount,
             method = x.Method,
+            supplierId = x.SupplierId,
+            employeeId = x.EmployeeId,
+            accountId = x.AccountId,
             supplierName = x.SupplierName,
+            employeeName = x.EmployeeName,
             accountName = x.AccountName,
             attachmentUrl = x.AttachmentUrl,
             note = x.Note,
@@ -614,11 +1071,27 @@ public sealed class AccountingService(PosDbContext db)
             .Where(x => accountIds.Contains(x.Id))
             .ToDictionaryAsync(x => x.Id, x => x, ct);
 
-        var orderIds = transactions
+        var posSourceIds = transactions
             .Where(x => x.SourceType == "pos_payment" && x.SourceId.HasValue)
             .Select(x => x.SourceId!.Value)
             .Distinct()
             .ToList();
+        var posPayments = posSourceIds.Count == 0
+            ? []
+            : await db.Payments.AsNoTracking()
+                .Where(x => posSourceIds.Contains(x.Id))
+                .Select(x => new { x.Id, x.OrderId })
+                .ToListAsync(ct);
+        var orderIdByPaymentId = posPayments.ToDictionary(x => x.Id, x => x.OrderId);
+        var orderIds = posPayments.Select(x => x.OrderId).ToHashSet();
+        foreach (var sourceId in posSourceIds)
+        {
+            if (!orderIdByPaymentId.ContainsKey(sourceId))
+            {
+                orderIds.Add(sourceId);
+            }
+        }
+
         var receiptIds = transactions
             .Where(x => x.SourceType == "manual_receipt" && x.SourceId.HasValue)
             .Select(x => x.SourceId!.Value)
@@ -670,16 +1143,32 @@ public sealed class AccountingService(PosDbContext db)
                 .Where(x => supplierIds.Contains(x.Id))
                 .ToDictionaryAsync(x => x.Id, x => x, ct);
 
+        var employeeIds = expenses
+            .Where(x => x.EmployeeId.HasValue)
+            .Select(x => x.EmployeeId!.Value)
+            .Distinct()
+            .ToList();
+        var employeeById = employeeIds.Count == 0
+            ? new Dictionary<Guid, PosEmployee>()
+            : await db.Employees
+                .AsNoTracking()
+                .Where(x => employeeIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => x, ct);
+
         return transactions.Select(x =>
         {
             PosOrder? order = null;
             PosReceipt? receipt = null;
             PosExpense? expense = null;
             PosSupplier? supplier = null;
+            PosEmployee? employee = null;
 
             if (x.SourceType == "pos_payment" && x.SourceId.HasValue)
             {
-                orderById.TryGetValue(x.SourceId.Value, out order);
+                var orderId = orderIdByPaymentId.TryGetValue(x.SourceId.Value, out var mappedOrderId)
+                    ? mappedOrderId
+                    : x.SourceId.Value;
+                orderById.TryGetValue(orderId, out order);
             }
             else if (x.SourceType == "manual_receipt" && x.SourceId.HasValue)
             {
@@ -694,6 +1183,12 @@ public sealed class AccountingService(PosDbContext db)
             if (supplierId.HasValue)
             {
                 supplierById.TryGetValue(supplierId.Value, out supplier);
+            }
+
+            var employeeId = expense?.EmployeeId;
+            if (employeeId.HasValue)
+            {
+                employeeById.TryGetValue(employeeId.Value, out employee);
             }
 
             string? tableName = null;
@@ -716,9 +1211,404 @@ public sealed class AccountingService(PosDbContext db)
                 tableName,
                 source = receipt?.Source,
                 supplierName = supplier?.Name,
+                employeeName = employee?.Name,
                 category = expense?.Category,
             };
         }).ToList();
+    }
+
+    private async Task<Guid?> ResolveReferenceAccountId(
+        Guid? accountId,
+        Guid? supplierId,
+        Guid? employeeId,
+        CancellationToken ct)
+    {
+        if (supplierId.HasValue && employeeId.HasValue)
+        {
+            throw new InvalidOperationException("BAD_EXPENSE_TARGET");
+        }
+
+        if (accountId.HasValue)
+        {
+            await GetActiveManualAccountForOperations(accountId.Value, ct);
+            return accountId;
+        }
+
+        if (supplierId.HasValue)
+        {
+            var supplier = await db.Suppliers.AsNoTracking().FirstOrDefaultAsync(x => x.Id == supplierId.Value, ct);
+            if (supplier is null)
+            {
+                throw new InvalidOperationException("SUPPLIER_NOT_FOUND");
+            }
+
+            if (supplier.AccountId.HasValue)
+            {
+                await GetActiveManualAccountForOperations(supplier.AccountId.Value, ct);
+            }
+
+            return supplier.AccountId;
+        }
+
+        if (employeeId.HasValue)
+        {
+            var employee = await db.Employees.AsNoTracking().FirstOrDefaultAsync(x => x.Id == employeeId.Value, ct);
+            if (employee is null)
+            {
+                throw new InvalidOperationException("EMPLOYEE_NOT_FOUND");
+            }
+
+            if (employee.AccountId.HasValue)
+            {
+                await GetActiveManualAccountForOperations(employee.AccountId.Value, ct);
+            }
+
+            return employee.AccountId;
+        }
+
+        return null;
+    }
+
+    private async Task<Guid?> ResolveOrCreateAccountId(
+        Guid? accountId,
+        string? createAccountName,
+        string? createAccountType,
+        string? createAccountCurrency,
+        string defaultType,
+        CancellationToken ct)
+    {
+        var hasCreateAccount = !string.IsNullOrWhiteSpace(createAccountName);
+        if (accountId.HasValue && hasCreateAccount)
+        {
+            throw new InvalidOperationException("BAD_ACCOUNT_SELECTION");
+        }
+
+        if (accountId.HasValue)
+        {
+            await GetActiveManualAccountForOperations(accountId.Value, ct);
+            return accountId.Value;
+        }
+
+        if (!hasCreateAccount)
+        {
+            return null;
+        }
+
+        var account = new PosAccount
+        {
+            Id = Guid.NewGuid(),
+            Name = createAccountName!.Trim(),
+            Type = string.IsNullOrWhiteSpace(createAccountType) ? defaultType : createAccountType.Trim().ToLowerInvariant(),
+            Currency = string.IsNullOrWhiteSpace(createAccountCurrency) ? "ILS" : createAccountCurrency.Trim().ToUpperInvariant(),
+            IsActive = true,
+            AccountScope = "custom",
+            AccountKey = null,
+            IsSystem = false,
+            IsLocked = false,
+            ShiftId = null,
+            BaseAccountId = null,
+            CreatedAt = DateTime.UtcNow,
+        };
+
+        db.Accounts.Add(account);
+        await SaveWithConflictHandling(ct);
+        return account.Id;
+    }
+
+    private async Task<object?> BuildAccountView(Guid accountId, CancellationToken ct)
+    {
+        var row = await (
+            from a in db.Accounts.AsNoTracking()
+            join parent in db.Accounts.AsNoTracking() on a.ParentAccountId equals parent.Id into parentJoin
+            from parent in parentJoin.DefaultIfEmpty()
+            where a.Id == accountId
+            select new
+            {
+                a.Id,
+                a.Name,
+                a.Type,
+                a.Currency,
+                a.IsActive,
+                a.IsSystem,
+                a.IsLocked,
+                a.AccountScope,
+                a.AccountKey,
+                a.ShiftId,
+                a.BaseAccountId,
+                a.ParentAccountId,
+                ParentAccountName = parent != null ? parent.Name : null,
+                a.CreatedAt,
+            }).FirstOrDefaultAsync(ct);
+        if (row is null)
+        {
+            return null;
+        }
+
+        var balance = await db.AccountTransactions
+            .AsNoTracking()
+            .Where(x => x.AccountId == accountId)
+            .SumAsync(x => x.Direction == "in" ? x.Amount : -x.Amount, ct);
+
+        var relations = await (
+            from rel in db.AccountRelations.AsNoTracking()
+            join target in db.Accounts.AsNoTracking() on rel.ToAccountId equals target.Id into targetJoin
+            from target in targetJoin.DefaultIfEmpty()
+            where rel.FromAccountId == accountId
+            orderby rel.Kind, target != null ? target.Name : null
+            select new
+            {
+                rel.ToAccountId,
+                TargetAccountName = target != null ? target.Name : null,
+                rel.Percentage,
+                rel.Kind,
+            }).ToListAsync(ct);
+
+        var subAccountsCount = await db.Accounts.AsNoTracking().CountAsync(x => x.ParentAccountId == accountId, ct);
+
+        return new
+        {
+            id = row.Id,
+            name = row.Name,
+            type = row.Type,
+            currency = row.Currency,
+            isActive = row.IsActive,
+            isSystem = row.IsSystem,
+            isLocked = row.IsLocked,
+            accountScope = row.AccountScope,
+            accountKey = row.AccountKey,
+            shiftId = row.ShiftId,
+            baseAccountId = row.BaseAccountId,
+            parentAccountId = row.ParentAccountId,
+            parentAccountName = row.ParentAccountName,
+            createdAt = row.CreatedAt,
+            balance = (double)balance,
+            subAccountsCount,
+            relations = relations.Select(x => (object)new
+            {
+                targetAccountId = x.ToAccountId,
+                targetAccountName = x.TargetAccountName,
+                percentage = (double)x.Percentage,
+                kind = x.Kind,
+            }).ToList(),
+        };
+    }
+
+    private async Task ValidateParentAssignment(Guid accountId, Guid? parentAccountId, CancellationToken ct)
+    {
+        if (!parentAccountId.HasValue)
+        {
+            return;
+        }
+
+        if (parentAccountId.Value == accountId)
+        {
+            throw new InvalidOperationException("ACCOUNT_PARENT_SELF");
+        }
+
+        var parent = await db.Accounts.AsNoTracking().FirstOrDefaultAsync(x => x.Id == parentAccountId.Value, ct);
+        if (parent is null)
+        {
+            throw new InvalidOperationException("PARENT_ACCOUNT_NOT_FOUND");
+        }
+
+        if (string.Equals(parent.AccountScope, SystemAccountsService.ShiftSessionScope, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("ACCOUNT_MANAGED_BY_SHIFT");
+        }
+
+        var cursor = parent.ParentAccountId;
+        var guard = 0;
+        while (cursor.HasValue && guard < 200)
+        {
+            if (cursor.Value == accountId)
+            {
+                throw new InvalidOperationException("ACCOUNT_PARENT_CYCLE");
+            }
+
+            var next = await db.Accounts
+                .AsNoTracking()
+                .Where(x => x.Id == cursor.Value)
+                .Select(x => x.ParentAccountId)
+                .FirstOrDefaultAsync(ct);
+
+            cursor = next;
+            guard++;
+        }
+    }
+
+    private async Task ReplaceAccountRelations(Guid fromAccountId, IReadOnlyList<AccountRelationInput> relations, CancellationToken ct)
+    {
+        var existing = await db.AccountRelations.Where(x => x.FromAccountId == fromAccountId).ToListAsync(ct);
+        if (existing.Count > 0)
+        {
+            db.AccountRelations.RemoveRange(existing);
+        }
+
+        if (relations.Count == 0)
+        {
+            return;
+        }
+
+        var normalized = new List<(Guid TargetAccountId, decimal Percentage, string Kind)>();
+        foreach (var rel in relations)
+        {
+            if (rel.TargetAccountId == Guid.Empty)
+            {
+                throw new InvalidOperationException("BAD_ACCOUNT_RELATION");
+            }
+
+            if (rel.TargetAccountId == fromAccountId)
+            {
+                throw new InvalidOperationException("ACCOUNT_RELATION_SELF");
+            }
+
+            var percentage = Math.Round(rel.Percentage, 2, MidpointRounding.AwayFromZero);
+            if (percentage <= 0 || percentage > 100)
+            {
+                throw new InvalidOperationException("BAD_ACCOUNT_RELATION_PERCENTAGE");
+            }
+
+            var kind = NormalizeRelationKind(rel.Kind);
+            normalized.Add((rel.TargetAccountId, percentage, kind));
+        }
+
+        if (normalized
+            .GroupBy(x => new { x.TargetAccountId, x.Kind })
+            .Any(g => g.Count() > 1))
+        {
+            throw new InvalidOperationException("ACCOUNT_RELATION_DUPLICATE");
+        }
+
+        foreach (var group in normalized.GroupBy(x => x.Kind))
+        {
+            var total = group.Sum(x => x.Percentage);
+            if (total > 100)
+            {
+                throw new InvalidOperationException("ACCOUNT_RELATION_PERCENTAGE_OVER_100");
+            }
+        }
+
+        var targetIds = normalized.Select(x => x.TargetAccountId).Distinct().ToList();
+        var targets = await db.Accounts.AsNoTracking()
+            .Where(x => targetIds.Contains(x.Id))
+            .ToDictionaryAsync(x => x.Id, x => x, ct);
+        if (targets.Count != targetIds.Count)
+        {
+            throw new InvalidOperationException("RELATION_ACCOUNT_NOT_FOUND");
+        }
+
+        foreach (var target in targets.Values)
+        {
+            if (string.Equals(target.AccountScope, SystemAccountsService.ShiftSessionScope, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("ACCOUNT_MANAGED_BY_SHIFT");
+            }
+        }
+
+        foreach (var rel in normalized)
+        {
+            db.AccountRelations.Add(new PosAccountRelation
+            {
+                Id = Guid.NewGuid(),
+                FromAccountId = fromAccountId,
+                ToAccountId = rel.TargetAccountId,
+                Percentage = rel.Percentage,
+                Kind = rel.Kind,
+                CreatedAt = DateTime.UtcNow,
+            });
+        }
+    }
+
+    private static string NormalizeRelationKind(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return "allocation";
+        }
+
+        return raw.Trim().ToLowerInvariant();
+    }
+
+    private async Task<PosAccount> GetActiveManualAccountForOperations(Guid accountId, CancellationToken ct)
+    {
+        var account = await db.Accounts.FirstOrDefaultAsync(x => x.Id == accountId, ct);
+        if (account is null)
+        {
+            throw new InvalidOperationException("ACCOUNT_NOT_FOUND");
+        }
+
+        if (!account.IsActive)
+        {
+            throw new InvalidOperationException("ACCOUNT_INACTIVE");
+        }
+
+        if (string.Equals(account.AccountScope, SystemAccountsService.ShiftSessionScope, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("ACCOUNT_MANAGED_BY_SHIFT");
+        }
+
+        return account;
+    }
+
+    private async Task<CashierExpenseSettingsSnapshot> LoadCashierExpenseSettings(CancellationToken ct)
+    {
+        var rows = await db.AppSettings
+            .AsNoTracking()
+            .Where(x =>
+                x.Key == PosSettingKeys.CashierExpensesEnabled ||
+                x.Key == PosSettingKeys.CashierExpensesCapAmount)
+            .ToListAsync(ct);
+
+        var enabledRaw = rows.FirstOrDefault(x => x.Key == PosSettingKeys.CashierExpensesEnabled)?.Value;
+        var capRaw = rows.FirstOrDefault(x => x.Key == PosSettingKeys.CashierExpensesCapAmount)?.Value;
+
+        var enabled = ParseSettingBool(enabledRaw) ?? true;
+        var capAmount = ParseSettingDecimal(capRaw);
+        if (capAmount.HasValue && capAmount.Value <= 0)
+        {
+            capAmount = null;
+        }
+
+        return new CashierExpenseSettingsSnapshot(enabled, capAmount);
+    }
+
+    private static bool? ParseSettingBool(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        if (bool.TryParse(raw.Trim(), out var parsed))
+        {
+            return parsed;
+        }
+
+        return raw.Trim() switch
+        {
+            "1" => true,
+            "0" => false,
+            _ => null,
+        };
+    }
+
+    private static decimal? ParseSettingDecimal(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        if (decimal.TryParse(
+                raw.Trim(),
+                System.Globalization.NumberStyles.Number,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var parsed))
+        {
+            return parsed;
+        }
+
+        return null;
     }
 
     public async Task<List<object>> ReportDailySales(DateOnly start, DateOnly end, CancellationToken ct)
@@ -815,3 +1705,5 @@ public sealed class AccountingService(PosDbContext db)
         }
     }
 }
+
+public sealed record AccountRelationInput(Guid TargetAccountId, decimal Percentage, string? Kind);

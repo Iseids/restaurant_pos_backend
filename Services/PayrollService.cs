@@ -26,9 +26,20 @@ public sealed class PayrollService(PosDbContext db)
         double overtimeModifier,
         double overtimeThresholdHours,
         string? note,
+        Guid? accountId,
+        string? createAccountName,
+        string? createAccountType,
+        string? createAccountCurrency,
         CancellationToken ct)
     {
         ValidateEmployeeInputs(payRate, overtimeModifier, overtimeThresholdHours);
+        var resolvedAccountId = await ResolveOrCreateAccountId(
+            accountId,
+            createAccountName,
+            createAccountType,
+            createAccountCurrency,
+            "employee",
+            ct);
 
         var now = DateTime.UtcNow;
         var entity = new PosEmployee
@@ -39,6 +50,7 @@ public sealed class PayrollService(PosDbContext db)
             OvertimeModifier = (decimal)overtimeModifier,
             OvertimeThresholdHours = (decimal)overtimeThresholdHours,
             Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim(),
+            AccountId = resolvedAccountId,
             IsActive = true,
             CreatedAt = now,
             UpdatedAt = now,
@@ -57,6 +69,11 @@ public sealed class PayrollService(PosDbContext db)
         double? overtimeThresholdHours,
         string? note,
         bool hasNote,
+        Guid? accountId,
+        bool hasAccountId,
+        string? createAccountName,
+        string? createAccountType,
+        string? createAccountCurrency,
         bool? isActive,
         CancellationToken ct)
     {
@@ -104,6 +121,30 @@ public sealed class PayrollService(PosDbContext db)
         if (hasNote)
         {
             entity.Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(createAccountName))
+        {
+            entity.AccountId = await ResolveOrCreateAccountId(
+                null,
+                createAccountName,
+                createAccountType,
+                createAccountCurrency,
+                "employee",
+                ct);
+        }
+        else if (hasAccountId)
+        {
+            if (accountId.HasValue)
+            {
+                var accountExists = await db.Accounts.AsNoTracking().AnyAsync(x => x.Id == accountId.Value, ct);
+                if (!accountExists)
+                {
+                    throw new InvalidOperationException("ACCOUNT_NOT_FOUND");
+                }
+            }
+
+            entity.AccountId = accountId;
         }
 
         if (isActive.HasValue)
@@ -502,6 +543,7 @@ public sealed class PayrollService(PosDbContext db)
             overtimeModifier = (double)x.OvertimeModifier,
             overtimeThresholdHours = (double)x.OvertimeThresholdHours,
             note = x.Note,
+            accountId = x.AccountId,
             isActive = x.IsActive,
             createdAt = x.CreatedAt,
             updatedAt = x.UpdatedAt,
@@ -592,6 +634,57 @@ public sealed class PayrollService(PosDbContext db)
         {
             throw new InvalidOperationException("BAD_OVERTIME_THRESHOLD");
         }
+    }
+
+    private async Task<Guid?> ResolveOrCreateAccountId(
+        Guid? accountId,
+        string? createAccountName,
+        string? createAccountType,
+        string? createAccountCurrency,
+        string defaultType,
+        CancellationToken ct)
+    {
+        var hasCreateAccount = !string.IsNullOrWhiteSpace(createAccountName);
+        if (accountId.HasValue && hasCreateAccount)
+        {
+            throw new InvalidOperationException("BAD_ACCOUNT_SELECTION");
+        }
+
+        if (accountId.HasValue)
+        {
+            var exists = await db.Accounts.AsNoTracking().AnyAsync(x => x.Id == accountId.Value, ct);
+            if (!exists)
+            {
+                throw new InvalidOperationException("ACCOUNT_NOT_FOUND");
+            }
+
+            return accountId.Value;
+        }
+
+        if (!hasCreateAccount)
+        {
+            return null;
+        }
+
+        var account = new PosAccount
+        {
+            Id = Guid.NewGuid(),
+            Name = createAccountName!.Trim(),
+            Type = string.IsNullOrWhiteSpace(createAccountType) ? defaultType : createAccountType.Trim().ToLowerInvariant(),
+            Currency = string.IsNullOrWhiteSpace(createAccountCurrency) ? "ILS" : createAccountCurrency.Trim().ToUpperInvariant(),
+            IsActive = true,
+            AccountScope = "custom",
+            AccountKey = null,
+            IsSystem = false,
+            IsLocked = false,
+            ShiftId = null,
+            BaseAccountId = null,
+            CreatedAt = DateTime.UtcNow,
+        };
+
+        db.Accounts.Add(account);
+        await SaveWithConflictHandling(ct);
+        return account.Id;
     }
 
     private async Task EnsureEmployeeExists(Guid employeeId, CancellationToken ct)

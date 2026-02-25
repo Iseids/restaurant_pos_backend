@@ -25,6 +25,7 @@ public sealed class PosDbContext(DbContextOptions<PosDbContext> options) : DbCon
     public DbSet<PosMenuItemMaterial> MenuItemMaterials => Set<PosMenuItemMaterial>();
     public DbSet<PosPrintQueue> PrintQueue => Set<PosPrintQueue>();
     public DbSet<PosAccount> Accounts => Set<PosAccount>();
+    public DbSet<PosAccountRelation> AccountRelations => Set<PosAccountRelation>();
     public DbSet<PosPaymentMethodAccount> PaymentMethodAccounts => Set<PosPaymentMethodAccount>();
     public DbSet<PosSupplier> Suppliers => Set<PosSupplier>();
     public DbSet<PosReceipt> Receipts => Set<PosReceipt>();
@@ -33,6 +34,7 @@ public sealed class PosDbContext(DbContextOptions<PosDbContext> options) : DbCon
     public DbSet<PosAccountTransaction> AccountTransactions => Set<PosAccountTransaction>();
     public DbSet<PosEmployee> Employees => Set<PosEmployee>();
     public DbSet<PosEmployeeTimeEntry> EmployeeTimeEntries => Set<PosEmployeeTimeEntry>();
+    public DbSet<PosAuditLog> AuditLogs => Set<PosAuditLog>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -81,6 +83,7 @@ public sealed class PosDbContext(DbContextOptions<PosDbContext> options) : DbCon
         modelBuilder.Entity<PosAccountTransfer>().Property(x => x.Amount).HasPrecision(12, 2);
         modelBuilder.Entity<PosAccountTransaction>().Property(x => x.Amount).HasPrecision(12, 2);
         modelBuilder.Entity<PosEmployee>().Property(x => x.PayRate).HasPrecision(12, 2);
+        modelBuilder.Entity<PosAccountRelation>().Property(x => x.Percentage).HasPrecision(5, 2);
 
         modelBuilder.Entity<PosEmployeeTimeEntry>()
             .HasOne(x => x.Employee)
@@ -88,11 +91,57 @@ public sealed class PosDbContext(DbContextOptions<PosDbContext> options) : DbCon
             .HasForeignKey(x => x.EmployeeId)
             .OnDelete(DeleteBehavior.Cascade);
 
+        modelBuilder.Entity<PosAccount>()
+            .HasOne<PosAccount>()
+            .WithMany()
+            .HasForeignKey(x => x.ParentAccountId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<PosSupplier>()
+            .HasOne<PosAccount>()
+            .WithMany()
+            .HasForeignKey(x => x.AccountId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<PosEmployee>()
+            .HasOne<PosAccount>()
+            .WithMany()
+            .HasForeignKey(x => x.AccountId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<PosExpense>()
+            .HasOne<PosEmployee>()
+            .WithMany()
+            .HasForeignKey(x => x.EmployeeId)
+            .OnDelete(DeleteBehavior.SetNull);
+
         modelBuilder.Entity<PosEmployeeTimeEntry>()
             .HasIndex(x => new { x.EmployeeId, x.WorkDate });
 
         modelBuilder.Entity<PosEmployeeTimeEntry>()
             .HasIndex(x => new { x.EmployeeId, x.WorkDate, x.StartTime, x.EndTime })
+            .IsUnique();
+
+        modelBuilder.Entity<PosAuditLog>()
+            .HasIndex(x => x.CreatedAt);
+
+        modelBuilder.Entity<PosAccount>()
+            .HasIndex(x => new { x.AccountScope, x.AccountKey });
+
+        modelBuilder.Entity<PosAccount>()
+            .HasIndex(x => x.ShiftId);
+
+        modelBuilder.Entity<PosAccount>()
+            .HasIndex(x => x.ParentAccountId);
+
+        modelBuilder.Entity<PosAccountRelation>()
+            .HasIndex(x => x.FromAccountId);
+
+        modelBuilder.Entity<PosAccountRelation>()
+            .HasIndex(x => x.ToAccountId);
+
+        modelBuilder.Entity<PosAccountRelation>()
+            .HasIndex(x => new { x.FromAccountId, x.ToAccountId, x.Kind })
             .IsUnique();
 
         base.OnModelCreating(modelBuilder);
