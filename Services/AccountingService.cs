@@ -6,7 +6,7 @@ using ResPosBackend.Models;
 
 namespace ResPosBackend.Services;
 
-public sealed class AccountingService(PosDbContext db)
+public sealed class AccountingService(PosDbContext db, SystemAccountsService systemAccounts)
 {
     private sealed record CashierExpenseSettingsSnapshot(bool EnabledForCashier, decimal? CapAmount);
 
@@ -548,6 +548,12 @@ public sealed class AccountingService(PosDbContext db)
         await using var tx = await db.Database.BeginTransactionAsync(ct);
 
         var now = DateTime.UtcNow;
+        var vaultAccounts = await systemAccounts.EnsureVaultBaseAccounts(now, ct);
+        if (!vaultAccounts.TryGetValue(SystemAccountsService.ExpensesAccountKey, out var expenseAccount))
+        {
+            throw new InvalidOperationException("EXPENSE_ACCOUNT_MISSING");
+        }
+
         var entity = new PosExpense
         {
             Id = Guid.NewGuid(),
@@ -557,7 +563,7 @@ public sealed class AccountingService(PosDbContext db)
             EmployeeId = employeeId,
             Amount = (decimal)amount,
             Method = method,
-            AccountId = resolvedAccountId,
+            AccountId = expenseAccount.Id,
             AttachmentUrl = string.IsNullOrWhiteSpace(attachmentUrl) ? null : attachmentUrl.Trim(),
             Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim(),
             CreatedBy = createdBy,
@@ -572,6 +578,19 @@ public sealed class AccountingService(PosDbContext db)
             Id = Guid.NewGuid(),
             AccountId = resolvedAccountId.Value,
             Direction = "out",
+            Amount = (decimal)amount,
+            SourceType = "expense",
+            SourceId = entity.Id,
+            Note = entity.Note,
+            CreatedBy = createdBy,
+            CreatedAt = now,
+        });
+
+        db.AccountTransactions.Add(new PosAccountTransaction
+        {
+            Id = Guid.NewGuid(),
+            AccountId = expenseAccount.Id,
+            Direction = "in",
             Amount = (decimal)amount,
             SourceType = "expense",
             SourceId = entity.Id,
@@ -599,6 +618,26 @@ public sealed class AccountingService(PosDbContext db)
     public async Task<object> GetCashierExpenseOverview(CancellationToken ct)
     {
         var settings = await LoadCashierExpenseSettings(ct);
+        var suppliers = await db.Suppliers
+            .AsNoTracking()
+            .Where(x => x.IsActive)
+            .OrderBy(x => x.Name)
+            .Select(x => new
+            {
+                x.Id,
+                x.Name,
+            })
+            .ToListAsync(ct);
+        var employees = await db.Employees
+            .AsNoTracking()
+            .Where(x => x.IsActive)
+            .OrderBy(x => x.Name)
+            .Select(x => new
+            {
+                x.Id,
+                x.Name,
+            })
+            .ToListAsync(ct);
 
         var shift = await db.Shifts
             .AsNoTracking()
@@ -615,20 +654,26 @@ public sealed class AccountingService(PosDbContext db)
                 remainingAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
                 shift = (object?)null,
                 items = Array.Empty<object>(),
+                suppliers = suppliers.Select(x => (object)new
+                {
+                    id = x.Id,
+                    name = x.Name,
+                }).ToList(),
+                employees = employees.Select(x => (object)new
+                {
+                    id = x.Id,
+                    name = x.Name,
+                }).ToList(),
             };
         }
 
-        var shiftCashAccount = await db.Accounts
-            .AsNoTracking()
-            .FirstOrDefaultAsync(x =>
-                x.AccountScope == SystemAccountsService.ShiftSessionScope &&
-                x.ShiftId == shift.Id &&
-                x.AccountKey == "cash",
-                ct);
+        var shiftAccounts = await systemAccounts.EnsureShiftSessionAccounts(shift, DateTime.UtcNow, ct);
+        shiftAccounts.TryGetValue("cash", out var shiftCashAccount);
+        shiftAccounts.TryGetValue(SystemAccountsService.ExpensesAccountKey, out var shiftExpenseAccount);
 
         decimal spent = 0m;
         var expenses = new List<object>();
-        if (shiftCashAccount is not null)
+        if (shiftCashAccount is not null && shiftExpenseAccount is not null)
         {
             spent = await db.AccountTransactions
                 .AsNoTracking()
@@ -639,12 +684,30 @@ public sealed class AccountingService(PosDbContext db)
                 .Select(x => (decimal?)x.Amount)
                 .SumAsync(ct) ?? 0m;
 
-            var rows = await db.Expenses
-                .AsNoTracking()
-                .Where(x =>
-                    x.AccountId == shiftCashAccount.Id &&
-                    x.CreatedAt >= shift.OpenedAt)
-                .OrderByDescending(x => x.CreatedAt)
+            var rows = await (
+                from e in db.Expenses.AsNoTracking()
+                join s in db.Suppliers.AsNoTracking() on e.SupplierId equals s.Id into sJoin
+                from s in sJoin.DefaultIfEmpty()
+                join emp in db.Employees.AsNoTracking() on e.EmployeeId equals emp.Id into empJoin
+                from emp in empJoin.DefaultIfEmpty()
+                where (e.AccountId == shiftExpenseAccount.Id || e.AccountId == shiftCashAccount.Id) &&
+                      e.CreatedAt >= shift.OpenedAt
+                orderby e.CreatedAt descending
+                select new
+                {
+                    e.Id,
+                    e.ExpenseDate,
+                    e.Category,
+                    e.Amount,
+                    e.Method,
+                    e.AccountId,
+                    e.SupplierId,
+                    e.EmployeeId,
+                    e.Note,
+                    e.CreatedAt,
+                    SupplierName = s != null ? s.Name : null,
+                    EmployeeName = emp != null ? emp.Name : null,
+                })
                 .Take(200)
                 .ToListAsync(ct);
 
@@ -656,6 +719,10 @@ public sealed class AccountingService(PosDbContext db)
                 amount = (double)x.Amount,
                 method = x.Method,
                 accountId = x.AccountId,
+                supplierId = x.SupplierId,
+                employeeId = x.EmployeeId,
+                supplierName = x.SupplierName,
+                employeeName = x.EmployeeName,
                 note = x.Note,
                 createdAt = x.CreatedAt,
             }).ToList();
@@ -678,15 +745,28 @@ public sealed class AccountingService(PosDbContext db)
                 openedBy = shift.OpenedBy,
                 cashAccountId = shiftCashAccount?.Id,
                 cashAccountName = shiftCashAccount?.Name,
+                expenseAccountId = shiftExpenseAccount?.Id,
+                expenseAccountName = shiftExpenseAccount?.Name,
             },
             items = expenses,
+            suppliers = suppliers.Select(x => (object)new
+            {
+                id = x.Id,
+                name = x.Name,
+            }).ToList(),
+            employees = employees.Select(x => (object)new
+            {
+                id = x.Id,
+                name = x.Name,
+            }).ToList(),
         };
     }
 
     public async Task<object> CreateCashierExpense(
         Guid createdBy,
-        string category,
         double amount,
+        Guid? supplierId,
+        Guid? employeeId,
         DateOnly? expenseDate,
         string? note,
         CancellationToken ct)
@@ -697,36 +777,17 @@ public sealed class AccountingService(PosDbContext db)
             throw new InvalidOperationException("CASHIER_EXPENSES_DISABLED");
         }
 
+        if (amount <= 0)
+        {
+            throw new InvalidOperationException("CASHIER_EXPENSE_AMOUNT_INVALID");
+        }
+
         await using var tx = await db.Database.BeginTransactionAsync(ct);
-
-        var shift = await db.Shifts
-            .OrderByDescending(x => x.OpenedAt)
-            .FirstOrDefaultAsync(x => x.ClosedAt == null, ct);
-        if (shift is null)
-        {
-            throw new InvalidOperationException("SHIFT_REQUIRED");
-        }
-
-        var shiftCashAccount = await db.Accounts
-            .FirstOrDefaultAsync(x =>
-                x.AccountScope == SystemAccountsService.ShiftSessionScope &&
-                x.ShiftId == shift.Id &&
-                x.AccountKey == "cash" &&
-                x.IsActive,
-                ct);
-        if (shiftCashAccount is null)
-        {
-            throw new InvalidOperationException("SHIFT_CASH_ACCOUNT_NOT_FOUND");
-        }
+        var (_, shiftCashAccount, shiftExpenseAccount) = await GetOpenShiftCashAndExpenseAccounts(ct);
+        var (supplier, employee) = await ResolveCashierExpenseTarget(supplierId, employeeId, ct);
 
         var requestedAmount = decimal.Round((decimal)amount, 2, MidpointRounding.AwayFromZero);
-        var spent = await db.AccountTransactions
-            .Where(x =>
-                x.AccountId == shiftCashAccount.Id &&
-                x.SourceType == "cashier_expense" &&
-                x.Direction == "out")
-            .Select(x => (decimal?)x.Amount)
-            .SumAsync(ct) ?? 0m;
+        var spent = await SumCashierExpenseSpent(shiftCashAccount.Id, null, ct);
 
         if (settings.CapAmount.HasValue && spent + requestedAmount > settings.CapAmount.Value + 0.0001m)
         {
@@ -738,12 +799,12 @@ public sealed class AccountingService(PosDbContext db)
         {
             Id = Guid.NewGuid(),
             ExpenseDate = expenseDate ?? DateOnly.FromDateTime(now),
-            Category = category,
-            SupplierId = null,
-            EmployeeId = null,
+            Category = "cashier_expense",
+            SupplierId = supplierId,
+            EmployeeId = employeeId,
             Amount = requestedAmount,
             Method = "cash",
-            AccountId = shiftCashAccount.Id,
+            AccountId = shiftExpenseAccount.Id,
             AttachmentUrl = null,
             Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim(),
             CreatedBy = createdBy,
@@ -758,6 +819,19 @@ public sealed class AccountingService(PosDbContext db)
             Id = Guid.NewGuid(),
             AccountId = shiftCashAccount.Id,
             Direction = "out",
+            Amount = requestedAmount,
+            SourceType = "cashier_expense",
+            SourceId = entity.Id,
+            Note = entity.Note ?? "Cashier expense",
+            CreatedBy = createdBy,
+            CreatedAt = now,
+        });
+
+        db.AccountTransactions.Add(new PosAccountTransaction
+        {
+            Id = Guid.NewGuid(),
+            AccountId = shiftExpenseAccount.Id,
+            Direction = "in",
             Amount = requestedAmount,
             SourceType = "cashier_expense",
             SourceId = entity.Id,
@@ -782,12 +856,269 @@ public sealed class AccountingService(PosDbContext db)
             amount = (double)entity.Amount,
             method = entity.Method,
             accountId = entity.AccountId,
+            supplierId = entity.SupplierId,
+            employeeId = entity.EmployeeId,
+            supplierName = supplier?.Name,
+            employeeName = employee?.Name,
             note = entity.Note,
             createdAt = entity.CreatedAt,
             capAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
             spentAmount = (double)spentAfter,
             remainingAmount = remainingAfter is null ? null : (double?)remainingAfter.Value,
         };
+    }
+
+    public async Task<object> UpdateCashierExpense(
+        Guid expenseId,
+        double amount,
+        Guid? supplierId,
+        Guid? employeeId,
+        DateOnly? expenseDate,
+        string? note,
+        CancellationToken ct)
+    {
+        if (amount <= 0)
+        {
+            throw new InvalidOperationException("CASHIER_EXPENSE_AMOUNT_INVALID");
+        }
+
+        var settings = await LoadCashierExpenseSettings(ct);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        var (_, shiftCashAccount, shiftExpenseAccount, expense, expenseOutTx, expenseInTx) =
+            await GetCashierExpenseForOpenShift(expenseId, ct);
+        var (supplier, employee) = await ResolveCashierExpenseTarget(supplierId, employeeId, ct);
+
+        var requestedAmount = decimal.Round((decimal)amount, 2, MidpointRounding.AwayFromZero);
+        var spentExcludingCurrent = await SumCashierExpenseSpent(shiftCashAccount.Id, expense.Id, ct);
+        if (settings.CapAmount.HasValue &&
+            spentExcludingCurrent + requestedAmount > settings.CapAmount.Value + 0.0001m)
+        {
+            throw new InvalidOperationException("CASHIER_EXPENSE_CAP_EXCEEDED");
+        }
+
+        expense.Amount = requestedAmount;
+        expense.SupplierId = supplierId;
+        expense.EmployeeId = employeeId;
+        expense.AccountId = shiftExpenseAccount.Id;
+        expense.Note = string.IsNullOrWhiteSpace(note) ? null : note.Trim();
+        if (expenseDate.HasValue)
+        {
+            expense.ExpenseDate = expenseDate.Value;
+        }
+
+        expenseOutTx.Amount = requestedAmount;
+        expenseOutTx.Note = expense.Note ?? "Cashier expense";
+        if (expenseInTx is null)
+        {
+            db.AccountTransactions.Add(new PosAccountTransaction
+            {
+                Id = Guid.NewGuid(),
+                AccountId = shiftExpenseAccount.Id,
+                Direction = "in",
+                Amount = requestedAmount,
+                SourceType = "cashier_expense",
+                SourceId = expense.Id,
+                Note = expense.Note ?? "Cashier expense",
+                CreatedBy = expense.CreatedBy,
+                CreatedAt = DateTime.UtcNow,
+            });
+        }
+        else
+        {
+            expenseInTx.AccountId = shiftExpenseAccount.Id;
+            expenseInTx.Amount = requestedAmount;
+            expenseInTx.Note = expense.Note ?? "Cashier expense";
+        }
+
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        var spentAfter = spentExcludingCurrent + requestedAmount;
+        var remainingAfter = settings.CapAmount.HasValue
+            ? Math.Max(0m, settings.CapAmount.Value - spentAfter)
+            : (decimal?)null;
+
+        return new
+        {
+            id = expense.Id,
+            date = expense.ExpenseDate.ToString("yyyy-MM-dd"),
+            category = expense.Category,
+            amount = (double)expense.Amount,
+            method = expense.Method,
+            accountId = expense.AccountId,
+            supplierId = expense.SupplierId,
+            employeeId = expense.EmployeeId,
+            supplierName = supplier?.Name,
+            employeeName = employee?.Name,
+            note = expense.Note,
+            createdAt = expense.CreatedAt,
+            capAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
+            spentAmount = (double)spentAfter,
+            remainingAmount = remainingAfter is null ? null : (double?)remainingAfter.Value,
+        };
+    }
+
+    public async Task<object> DeleteCashierExpense(Guid expenseId, CancellationToken ct)
+    {
+        var settings = await LoadCashierExpenseSettings(ct);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        var (_, shiftCashAccount, _, expense, expenseOutTx, expenseInTx) = await GetCashierExpenseForOpenShift(expenseId, ct);
+        db.AccountTransactions.Remove(expenseOutTx);
+        if (expenseInTx is not null)
+        {
+            db.AccountTransactions.Remove(expenseInTx);
+        }
+        db.Expenses.Remove(expense);
+        await db.SaveChangesAsync(ct);
+
+        var spentAfter = await SumCashierExpenseSpent(shiftCashAccount.Id, null, ct);
+        var remainingAfter = settings.CapAmount.HasValue
+            ? Math.Max(0m, settings.CapAmount.Value - spentAfter)
+            : (decimal?)null;
+
+        await tx.CommitAsync(ct);
+
+        return new
+        {
+            id = expenseId,
+            capAmount = settings.CapAmount is null ? null : (double?)settings.CapAmount.Value,
+            spentAmount = (double)spentAfter,
+            remainingAmount = remainingAfter is null ? null : (double?)remainingAfter.Value,
+        };
+    }
+
+    private async Task<(PosShift Shift, PosAccount ShiftCashAccount, PosAccount ShiftExpenseAccount)> GetOpenShiftCashAndExpenseAccounts(CancellationToken ct)
+    {
+        var shift = await db.Shifts
+            .OrderByDescending(x => x.OpenedAt)
+            .FirstOrDefaultAsync(x => x.ClosedAt == null, ct);
+        if (shift is null)
+        {
+            throw new InvalidOperationException("SHIFT_REQUIRED");
+        }
+
+        var shiftAccounts = await systemAccounts.EnsureShiftSessionAccounts(shift, DateTime.UtcNow, ct);
+        if (!shiftAccounts.TryGetValue("cash", out var shiftCashAccount) || shiftCashAccount is null)
+        {
+            throw new InvalidOperationException("SHIFT_CASH_ACCOUNT_NOT_FOUND");
+        }
+
+        if (!shiftAccounts.TryGetValue(SystemAccountsService.ExpensesAccountKey, out var shiftExpenseAccount) ||
+            shiftExpenseAccount is null)
+        {
+            throw new InvalidOperationException("SHIFT_EXPENSE_ACCOUNT_NOT_FOUND");
+        }
+
+        return (shift, shiftCashAccount, shiftExpenseAccount);
+    }
+
+    private async Task<(
+        PosShift Shift,
+        PosAccount ShiftCashAccount,
+        PosAccount ShiftExpenseAccount,
+        PosExpense Expense,
+        PosAccountTransaction ExpenseOutTx,
+        PosAccountTransaction? ExpenseInTx)> GetCashierExpenseForOpenShift(
+        Guid expenseId,
+        CancellationToken ct)
+    {
+        var (shift, shiftCashAccount, shiftExpenseAccount) = await GetOpenShiftCashAndExpenseAccounts(ct);
+        var expense = await db.Expenses
+            .FirstOrDefaultAsync(x =>
+                x.Id == expenseId &&
+                (x.AccountId == shiftExpenseAccount.Id || x.AccountId == shiftCashAccount.Id),
+                ct);
+        if (expense is null)
+        {
+            throw new InvalidOperationException("CASHIER_EXPENSE_NOT_FOUND");
+        }
+
+        var expenseOutTx = await db.AccountTransactions
+            .FirstOrDefaultAsync(x =>
+                x.AccountId == shiftCashAccount.Id &&
+                x.SourceType == "cashier_expense" &&
+                x.Direction == "out" &&
+                x.SourceId == expenseId,
+                ct);
+        if (expenseOutTx is null)
+        {
+            throw new InvalidOperationException("CASHIER_EXPENSE_NOT_FOUND");
+        }
+
+        var expenseInTx = await db.AccountTransactions
+            .FirstOrDefaultAsync(x =>
+                x.AccountId == shiftExpenseAccount.Id &&
+                x.SourceType == "cashier_expense" &&
+                x.Direction == "in" &&
+                x.SourceId == expenseId,
+                ct);
+
+        return (shift, shiftCashAccount, shiftExpenseAccount, expense, expenseOutTx, expenseInTx);
+    }
+
+    private async Task<decimal> SumCashierExpenseSpent(Guid accountId, Guid? excludeExpenseId, CancellationToken ct)
+    {
+        var query = db.AccountTransactions
+            .AsNoTracking()
+            .Where(x =>
+                x.AccountId == accountId &&
+                x.SourceType == "cashier_expense" &&
+                x.Direction == "out");
+        if (excludeExpenseId.HasValue)
+        {
+            query = query.Where(x => x.SourceId != excludeExpenseId.Value);
+        }
+
+        return await query.Select(x => (decimal?)x.Amount).SumAsync(ct) ?? 0m;
+    }
+
+    private async Task<(PosSupplier? Supplier, PosEmployee? Employee)> ResolveCashierExpenseTarget(
+        Guid? supplierId,
+        Guid? employeeId,
+        CancellationToken ct)
+    {
+        if (supplierId.HasValue && employeeId.HasValue)
+        {
+            throw new InvalidOperationException("BAD_EXPENSE_TARGET");
+        }
+
+        PosSupplier? supplier = null;
+        PosEmployee? employee = null;
+        if (supplierId.HasValue)
+        {
+            supplier = await db.Suppliers
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == supplierId.Value, ct);
+            if (supplier is null)
+            {
+                throw new InvalidOperationException("SUPPLIER_NOT_FOUND");
+            }
+
+            if (!supplier.IsActive)
+            {
+                throw new InvalidOperationException("SUPPLIER_INACTIVE");
+            }
+        }
+
+        if (employeeId.HasValue)
+        {
+            employee = await db.Employees
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == employeeId.Value, ct);
+            if (employee is null)
+            {
+                throw new InvalidOperationException("EMPLOYEE_NOT_FOUND");
+            }
+
+            if (!employee.IsActive)
+            {
+                throw new InvalidOperationException("EMPLOYEE_INACTIVE");
+            }
+        }
+
+        return (supplier, employee);
     }
 
     public async Task Deposit(Guid createdBy, Guid accountId, double amount, string? note, CancellationToken ct)

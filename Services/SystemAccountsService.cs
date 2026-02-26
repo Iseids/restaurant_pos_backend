@@ -10,6 +10,8 @@ public sealed class SystemAccountsService(PosDbContext db)
     public const string VaultBaseScope = "vault_base";
     public const string ShiftSessionScope = "shift_session";
     public const string ShiftSessionMainAccountKey = "session_main";
+    public const string ExpensesAccountKey = "expenses";
+    public const string IngredientStockScope = "ingredient_stock";
 
     private sealed record AccountBlueprint(string Method, string DisplayName, string Type);
 
@@ -19,6 +21,7 @@ public sealed class SystemAccountsService(PosDbContext db)
         new("card", "Card", "bank"),
         new("cheque", "Cheque", "bank"),
         new("debt", "Debt", "debt"),
+        new(ExpensesAccountKey, "Expenses", "other"),
     ];
 
     public static string NormalizeMethod(string? method)
@@ -277,6 +280,86 @@ public sealed class SystemAccountsService(PosDbContext db)
         return result;
     }
 
+    public async Task<PosAccount> EnsureIngredientStockAccount(PosRawMaterial material, DateTime now, CancellationToken ct)
+    {
+        var accountKey = material.Id.ToString("D");
+        var account = await db.Accounts
+            .FirstOrDefaultAsync(x =>
+                x.AccountScope == IngredientStockScope &&
+                x.AccountKey == accountKey,
+                ct);
+
+        var unit = NormalizeUnit(material.Unit);
+        if (account is null)
+        {
+            account = new PosAccount
+            {
+                Id = Guid.NewGuid(),
+                Name = $"Ingredient Stock - {material.Name}",
+                Type = "other",
+                Currency = unit,
+                IsActive = material.IsActive,
+                AccountScope = IngredientStockScope,
+                AccountKey = accountKey,
+                IsSystem = true,
+                IsLocked = true,
+                ShiftId = null,
+                BaseAccountId = null,
+                ParentAccountId = null,
+                CreatedAt = now,
+            };
+            db.Accounts.Add(account);
+            return account;
+        }
+
+        account.Name = $"Ingredient Stock - {material.Name}";
+        account.Type = "other";
+        account.Currency = unit;
+        account.IsActive = material.IsActive;
+        account.AccountScope = IngredientStockScope;
+        account.AccountKey = accountKey;
+        account.IsSystem = true;
+        account.IsLocked = true;
+        account.ShiftId = null;
+        account.BaseAccountId = null;
+        account.ParentAccountId = null;
+        return account;
+    }
+
+    public async Task EnsureIngredientStockAccounts(DateTime now, CancellationToken ct)
+    {
+        var materials = await db.RawMaterials
+            .AsNoTracking()
+            .OrderBy(x => x.Name)
+            .ToListAsync(ct);
+
+        foreach (var material in materials)
+        {
+            var account = await EnsureIngredientStockAccount(material, now, ct);
+            var balance = await db.AccountTransactions
+                .Where(x => x.AccountId == account.Id)
+                .SumAsync(x => x.Direction == "in" ? x.Amount : -x.Amount, ct);
+            var delta = material.StockQty - balance;
+            if (Math.Abs(delta) < 0.0001m)
+            {
+                continue;
+            }
+
+            db.AccountTransactions.Add(new PosAccountTransaction
+            {
+                Id = Guid.NewGuid(),
+                AccountId = account.Id,
+                Direction = delta >= 0 ? "in" : "out",
+                Amount = Math.Abs(delta),
+                SourceType = "material_stock_sync",
+                SourceId = material.Id,
+                Note = "Material stock sync",
+                CreatedBy = Guid.Empty,
+                CreatedAt = now,
+            });
+        }
+    }
+
     private async Task<Dictionary<string, PosAccount>> EnsureVaultBaseAccounts(string currency, DateTime now, CancellationToken ct)
     {
         var vaultAccounts = await db.Accounts
@@ -335,6 +418,12 @@ public sealed class SystemAccountsService(PosDbContext db)
         }
 
         return raw.Trim().ToUpperInvariant();
+    }
+
+    private static string NormalizeUnit(string? raw)
+    {
+        var unit = (raw ?? string.Empty).Trim();
+        return unit.Length == 0 ? "unit" : unit;
     }
 }
 

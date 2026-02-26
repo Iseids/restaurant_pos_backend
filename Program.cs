@@ -870,21 +870,23 @@ app.MapPost("/api/cashier/expenses", async (HttpContext ctx, HttpRequest req, Ac
     }
 
     var payload = await ReadJsonMap(req, ct);
-    var category = GetString(payload, "category")?.Trim() ?? string.Empty;
     var amount = GetDouble(payload, "amount");
+    var supplierId = GetGuid(payload, "supplierId");
+    var employeeId = GetGuid(payload, "employeeId");
     var note = GetString(payload, "note")?.Trim();
 
-    if (string.IsNullOrWhiteSpace(category) || !amount.HasValue || amount.Value <= 0)
+    if (!amount.HasValue || amount.Value <= 0)
     {
-        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "category and amount required");
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "amount required");
     }
 
     try
     {
         var item = await accounting.CreateCashierExpense(
             user!.Id,
-            category,
             amount.Value,
+            supplierId,
+            employeeId,
             ParseDateOnly(payload.TryGetValue("date", out var rawDate) ? GetElementAsString(rawDate) : null),
             note,
             ct);
@@ -906,9 +908,135 @@ app.MapPost("/api/cashier/expenses", async (HttpContext ctx, HttpRequest req, Ac
     {
         return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_CASH_ACCOUNT_NOT_FOUND", "Shift cash account is unavailable");
     }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_EXPENSE_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_EXPENSE_ACCOUNT_NOT_FOUND", "Shift expense account is unavailable");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_AMOUNT_INVALID")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "CASHIER_EXPENSE_AMOUNT_INVALID", "amount must be greater than zero");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_EXPENSE_TARGET")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_EXPENSE_TARGET", "Choose supplierId or employeeId, not both");
+    }
+    catch (InvalidOperationException ex) when (ex.Message is "SUPPLIER_NOT_FOUND" or "SUPPLIER_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, ex.Message, "Supplier is invalid");
+    }
+    catch (InvalidOperationException ex) when (ex.Message is "EMPLOYEE_NOT_FOUND" or "EMPLOYEE_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, ex.Message, "Employee is invalid");
+    }
     catch (Exception ex)
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "CREATE_FAILED", ex.Message);
+    }
+});
+
+app.MapPatch("/api/cashier/expenses/{expenseId:guid}", async (HttpContext ctx, HttpRequest req, Guid expenseId, AccountingService accounting, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Cashier, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var payload = await ReadJsonMap(req, ct);
+    var amount = GetDouble(payload, "amount");
+    var supplierId = GetGuid(payload, "supplierId");
+    var employeeId = GetGuid(payload, "employeeId");
+    var note = GetString(payload, "note")?.Trim();
+
+    if (!amount.HasValue || amount.Value <= 0)
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "amount required");
+    }
+
+    try
+    {
+        var item = await accounting.UpdateCashierExpense(
+            expenseId,
+            amount.Value,
+            supplierId,
+            employeeId,
+            ParseDateOnly(payload.TryGetValue("date", out var rawDate) ? GetElementAsString(rawDate) : null),
+            note,
+            ct);
+        return ApiResults.Ok(new { item });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_REQUIRED")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_REQUIRED", "No open shift");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_CASH_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_CASH_ACCOUNT_NOT_FOUND", "Shift cash account is unavailable");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_EXPENSE_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_EXPENSE_ACCOUNT_NOT_FOUND", "Shift expense account is unavailable");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "CASHIER_EXPENSE_NOT_FOUND", "Expense not found for current open shift");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_AMOUNT_INVALID")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "CASHIER_EXPENSE_AMOUNT_INVALID", "amount must be greater than zero");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_CAP_EXCEEDED")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "CASHIER_EXPENSE_CAP_EXCEEDED", "Expense cap exceeded");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "BAD_EXPENSE_TARGET")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_EXPENSE_TARGET", "Choose supplierId or employeeId, not both");
+    }
+    catch (InvalidOperationException ex) when (ex.Message is "SUPPLIER_NOT_FOUND" or "SUPPLIER_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, ex.Message, "Supplier is invalid");
+    }
+    catch (InvalidOperationException ex) when (ex.Message is "EMPLOYEE_NOT_FOUND" or "EMPLOYEE_INACTIVE")
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, ex.Message, "Employee is invalid");
+    }
+    catch (Exception ex)
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "UPDATE_FAILED", ex.Message);
+    }
+});
+
+app.MapDelete("/api/cashier/expenses/{expenseId:guid}", async (HttpContext ctx, Guid expenseId, AccountingService accounting, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Cashier, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    try
+    {
+        var item = await accounting.DeleteCashierExpense(expenseId, ct);
+        return ApiResults.Ok(new { item });
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_REQUIRED")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_REQUIRED", "No open shift");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_CASH_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_CASH_ACCOUNT_NOT_FOUND", "Shift cash account is unavailable");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "SHIFT_EXPENSE_ACCOUNT_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status409Conflict, "SHIFT_EXPENSE_ACCOUNT_NOT_FOUND", "Shift expense account is unavailable");
+    }
+    catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_NOT_FOUND")
+    {
+        return ApiResults.Error(StatusCodes.Status404NotFound, "CASHIER_EXPENSE_NOT_FOUND", "Expense not found for current open shift");
+    }
+    catch (Exception ex)
+    {
+        return ApiResults.Error(StatusCodes.Status400BadRequest, "DELETE_FAILED", ex.Message);
     }
 });
 
@@ -1115,11 +1243,16 @@ app.MapPut("/api/admin/settings/cashier-expenses", async (HttpContext ctx, HttpR
 
     var payload = await ReadJsonMap(req, ct);
     var enabledForCashier = GetBool(payload, "enabledForCashier");
+    var hasCapAmount = payload.ContainsKey("capAmount");
     var capAmount = GetDouble(payload, "capAmount");
 
     try
     {
-        var item = await admin.SetCashierExpenseSettings(enabledForCashier, capAmount, ct);
+        var item = await admin.SetCashierExpenseSettings(
+            enabledForCashier,
+            capAmount,
+            hasCapAmount,
+            ct);
         return ApiResults.Ok(new { item });
     }
     catch (InvalidOperationException ex) when (ex.Message == "CASHIER_EXPENSE_CAP_INVALID")
@@ -3497,6 +3630,7 @@ static async Task EnsureSystemAccountsBootstrapAsync(WebApplication app, Cancell
     await using var scope = app.Services.CreateAsyncScope();
     var systemAccounts = scope.ServiceProvider.GetRequiredService<SystemAccountsService>();
     await systemAccounts.EnsureVaultBaseAccounts(DateTime.UtcNow, ct);
+    await systemAccounts.EnsureIngredientStockAccounts(DateTime.UtcNow, ct);
     var db = scope.ServiceProvider.GetRequiredService<PosDbContext>();
     await db.SaveChangesAsync(ct);
 }

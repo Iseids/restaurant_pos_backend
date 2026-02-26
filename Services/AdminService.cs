@@ -8,7 +8,7 @@ using System.Text.Json;
 
 namespace ResPosBackend.Services;
 
-public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientFactory)
+public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientFactory, SystemAccountsService systemAccounts)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -172,25 +172,30 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         return ToCashierExpenseSettingsJson(snapshot);
     }
 
-    public async Task<object> SetCashierExpenseSettings(bool? enabledForCashier, double? capAmount, CancellationToken ct)
+    public async Task<object> SetCashierExpenseSettings(
+        bool? enabledForCashier,
+        double? capAmount,
+        bool hasCapAmount,
+        CancellationToken ct)
     {
         var snapshot = await LoadCashierExpenseSettings(ct);
         var nextEnabled = enabledForCashier ?? snapshot.EnabledForCashier;
         decimal? nextCapAmount = snapshot.CapAmount;
 
-        if (capAmount.HasValue)
+        if (hasCapAmount)
         {
-            if (capAmount.Value <= 0)
+            if (!capAmount.HasValue)
+            {
+                nextCapAmount = null;
+            }
+            else if (capAmount.Value <= 0)
             {
                 throw new InvalidOperationException("CASHIER_EXPENSE_CAP_INVALID");
             }
-
-            nextCapAmount = decimal.Round((decimal)capAmount.Value, 2);
-        }
-        else if (enabledForCashier.HasValue && !enabledForCashier.Value)
-        {
-            // Keep disabled mode permissive: clear cap to avoid stale validations.
-            nextCapAmount = null;
+            else
+            {
+                nextCapAmount = decimal.Round((decimal)capAmount.Value, 2);
+            }
         }
 
         await UpsertSetting(
@@ -640,12 +645,19 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
     public async Task<List<object>> ListMaterials(CancellationToken ct)
     {
         var items = await db.RawMaterials.AsNoTracking().OrderBy(x => x.Name).ToListAsync(ct);
+        var accountByKey = await db.Accounts
+            .AsNoTracking()
+            .Where(x => x.AccountScope == SystemAccountsService.IngredientStockScope && x.AccountKey != null)
+            .ToDictionaryAsync(x => x.AccountKey!, x => x, ct);
+
         return items.Select(x => (object)new
         {
             id = x.Id,
             name = x.Name,
             unit = x.Unit,
             stockQty = (double)x.StockQty,
+            accountId = accountByKey.TryGetValue(x.Id.ToString("D"), out var account) ? account.Id : (Guid?)null,
+            accountUnit = accountByKey.TryGetValue(x.Id.ToString("D"), out var unitAccount) ? unitAccount.Currency : null,
             isActive = x.IsActive,
             createdAt = x.CreatedAt,
         }).ToList();
@@ -653,6 +665,7 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
 
     public async Task<object> CreateMaterial(string name, string? unit, double stockQty, CancellationToken ct)
     {
+        var now = DateTime.UtcNow;
         var entity = new PosRawMaterial
         {
             Id = Guid.NewGuid(),
@@ -660,10 +673,12 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             Unit = string.IsNullOrWhiteSpace(unit) ? null : unit.Trim(),
             StockQty = (decimal)stockQty,
             IsActive = true,
-            CreatedAt = DateTime.UtcNow,
+            CreatedAt = now,
         };
 
         db.RawMaterials.Add(entity);
+        var account = await systemAccounts.EnsureIngredientStockAccount(entity, now, ct);
+        AddMaterialStockTransaction(account.Id, entity.StockQty, "material_stock_init", entity.Id, now);
         await SaveWithConflictHandling(ct);
 
         return new
@@ -672,6 +687,8 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             name = entity.Name,
             unit = entity.Unit,
             stockQty = (double)entity.StockQty,
+            accountId = account.Id,
+            accountUnit = account.Currency,
             isActive = entity.IsActive,
             createdAt = entity.CreatedAt,
         };
@@ -695,14 +712,22 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             entity.Unit = unit.Trim();
         }
 
-        if (stockDelta.HasValue)
+        var stockDeltaDecimal = stockDelta.HasValue ? (decimal?)stockDelta.Value : null;
+        if (stockDeltaDecimal.HasValue)
         {
-            entity.StockQty += (decimal)stockDelta.Value;
+            entity.StockQty += stockDeltaDecimal.Value;
         }
 
         if (isActive.HasValue)
         {
             entity.IsActive = isActive.Value;
+        }
+
+        var now = DateTime.UtcNow;
+        var account = await systemAccounts.EnsureIngredientStockAccount(entity, now, ct);
+        if (stockDeltaDecimal.HasValue)
+        {
+            AddMaterialStockTransaction(account.Id, stockDeltaDecimal.Value, "material_stock_adjust", entity.Id, now);
         }
 
         await SaveWithConflictHandling(ct);
@@ -713,9 +738,37 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             name = entity.Name,
             unit = entity.Unit,
             stockQty = (double)entity.StockQty,
+            accountId = account.Id,
+            accountUnit = account.Currency,
             isActive = entity.IsActive,
             createdAt = entity.CreatedAt,
         };
+    }
+
+    private void AddMaterialStockTransaction(
+        Guid accountId,
+        decimal delta,
+        string sourceType,
+        Guid materialId,
+        DateTime now)
+    {
+        if (Math.Abs(delta) < 0.0001m)
+        {
+            return;
+        }
+
+        db.AccountTransactions.Add(new PosAccountTransaction
+        {
+            Id = Guid.NewGuid(),
+            AccountId = accountId,
+            Direction = delta >= 0 ? "in" : "out",
+            Amount = Math.Abs(delta),
+            SourceType = sourceType,
+            SourceId = materialId,
+            Note = "Material stock movement",
+            CreatedBy = Guid.Empty,
+            CreatedAt = now,
+        });
     }
 
     public async Task<List<object>> ListMenuItems(Guid? categoryId, CancellationToken ct)
