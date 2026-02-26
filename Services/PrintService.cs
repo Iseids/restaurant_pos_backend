@@ -11,6 +11,7 @@ namespace ResPosBackend.Services;
 public sealed class PrintService(PosDbContext db, OrdersService orders)
 {
     private const int Paper80LineWidth = 48;
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private sealed record ActivePrinterRow(Guid Id, string Name, string Type, string? Address, bool IsActive);
     private sealed record InvoiceTemplateSettings(
         string BusinessName,
@@ -25,6 +26,13 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         string ReceiptTitleEn,
         string ReceiptTitleAr,
         bool ShowPaymentsSection);
+    private sealed record KitchenTicketTemplateSettings(
+        string KitchenOrderTitleEn,
+        string KitchenOrderTitleAr,
+        string KitchenUpdateTitleEn,
+        string KitchenUpdateTitleAr,
+        string LayoutVariant,
+        string? FooterNote);
 
     private sealed class InvoiceTemplatePayload
     {
@@ -40,6 +48,26 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         public string? ReceiptTitleEn { get; set; }
         public string? ReceiptTitleAr { get; set; }
         public bool? ShowPaymentsSection { get; set; }
+    }
+
+    private sealed class KitchenTicketTemplatePayload
+    {
+        public string? KitchenOrderTitleEn { get; set; }
+        public string? KitchenOrderTitleAr { get; set; }
+        public string? KitchenUpdateTitleEn { get; set; }
+        public string? KitchenUpdateTitleAr { get; set; }
+        public string? LayoutVariant { get; set; }
+        public string? FooterNote { get; set; }
+    }
+
+    private sealed class KitchenAdjustmentQueuePayload
+    {
+        public Guid ItemId { get; set; }
+        public string ChangeType { get; set; } = string.Empty;
+        public double? QtyDelta { get; set; }
+        public double? NewQty { get; set; }
+        public string? Reason { get; set; }
+        public string? Language { get; set; }
     }
 
     public Task<object> PrintKitchenForOrder(Guid orderId, CancellationToken ct)
@@ -138,6 +166,121 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         }
 
         return result;
+    }
+
+    public async Task<object> PrintKitchenItemAdjustment(
+        Guid orderId,
+        Guid itemId,
+        string changeType,
+        double? qtyDelta,
+        double? newQty,
+        string? reason,
+        string? language,
+        CancellationToken ct)
+    {
+        var item = await db.OrderItems
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == itemId && x.OrderId == orderId, ct);
+        if (item is null)
+        {
+            throw new PosNotFoundException("ORDER_ITEM_NOT_FOUND");
+        }
+
+        if (!item.PrinterId.HasValue)
+        {
+            return new
+            {
+                printed = false,
+                skipped = "Item has no assigned printer",
+            };
+        }
+
+        var printer = await db.Printers.AsNoTracking().FirstOrDefaultAsync(x => x.Id == item.PrinterId.Value, ct);
+        if (printer is null)
+        {
+            return new
+            {
+                printed = false,
+                skipped = "Assigned printer not found",
+            };
+        }
+
+        var payload = new KitchenAdjustmentQueuePayload
+        {
+            ItemId = itemId,
+            ChangeType = string.IsNullOrWhiteSpace(changeType) ? "updated" : changeType.Trim().ToLowerInvariant(),
+            QtyDelta = qtyDelta,
+            NewQty = newQty,
+            Reason = string.IsNullOrWhiteSpace(reason) ? null : reason.Trim(),
+            Language = string.IsNullOrWhiteSpace(language) ? null : language.Trim(),
+        };
+        var payloadJson = JsonSerializer.Serialize(payload, JsonOptions);
+
+        if (!printer.IsActive)
+        {
+            await QueuePrint(orderId, printer.Id, "kitchen_adjustment", "Printer inactive", ct, payloadJson);
+            return new
+            {
+                printed = false,
+                queued = $"{printer.Name} (inactive)",
+            };
+        }
+
+        if (!string.Equals(printer.Type, "network", StringComparison.OrdinalIgnoreCase))
+        {
+            await QueuePrint(
+                orderId,
+                printer.Id,
+                "kitchen_adjustment",
+                $"Unsupported printer type: {printer.Type}",
+                ct,
+                payloadJson);
+            return new
+            {
+                printed = false,
+                queued = $"{printer.Name} ({printer.Type})",
+            };
+        }
+
+        if (string.IsNullOrWhiteSpace(printer.Address))
+        {
+            await QueuePrint(orderId, printer.Id, "kitchen_adjustment", "Missing printer address", ct, payloadJson);
+            return new
+            {
+                printed = false,
+                queued = $"{printer.Name} (no address)",
+            };
+        }
+
+        try
+        {
+            var ticket = await BuildKitchenAdjustmentTicketBytes(
+                orderId,
+                itemId,
+                payload.ChangeType,
+                payload.QtyDelta,
+                payload.NewQty,
+                payload.Reason,
+                payload.Language,
+                ct);
+            await SendToNetworkPrinter(printer.Address!, ticket, ct);
+            await ClearQueuedPrint(orderId, printer.Id, "kitchen_adjustment", ct, payloadJson);
+            return new
+            {
+                printed = true,
+                printer = printer.Name,
+            };
+        }
+        catch (Exception ex)
+        {
+            await QueuePrint(orderId, printer.Id, "kitchen_adjustment", ex.Message, ct, payloadJson);
+            return new
+            {
+                printed = false,
+                queued = $"{printer.Name} (error)",
+                error = ex.Message,
+            };
+        }
     }
 
     public async Task<List<object>> ListActivePrinters(CancellationToken ct)
@@ -428,7 +571,8 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
 
     private async Task<string> ProcessQueueRow(PosPrintQueue row, CancellationToken ct)
     {
-        if (!string.Equals(row.Kind, "kitchen", StringComparison.OrdinalIgnoreCase))
+        var kind = (row.Kind ?? string.Empty).Trim().ToLowerInvariant();
+        if (kind != "kitchen" && kind != "kitchen_adjustment")
         {
             await TouchQueueFailure(row.Id, $"Unsupported kind: {row.Kind}", ct);
             return "failed";
@@ -459,18 +603,47 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             return "failed";
         }
 
-        var pendingItemIds = await orders.KitchenPendingItemIdsForPrinter(row.OrderId, row.PrinterId, ct);
-        if (pendingItemIds.Count == 0)
-        {
-            await DeleteQueueById(row.Id, ct);
-            return "cleared";
-        }
-
         try
         {
-            var ticket = await BuildKitchenTicketBytes(row.OrderId, pendingItemIds, null, ct);
-            await SendToNetworkPrinter(printer.Address!, ticket, ct);
-            await orders.MarkKitchenPrinted(pendingItemIds, ct);
+            if (kind == "kitchen")
+            {
+                var pendingItemIds = await orders.KitchenPendingItemIdsForPrinter(row.OrderId, row.PrinterId, ct);
+                if (pendingItemIds.Count == 0)
+                {
+                    await DeleteQueueById(row.Id, ct);
+                    return "cleared";
+                }
+
+                var ticket = await BuildKitchenTicketBytes(row.OrderId, pendingItemIds, null, ct);
+                await SendToNetworkPrinter(printer.Address!, ticket, ct);
+                await orders.MarkKitchenPrinted(pendingItemIds, ct);
+                await DeleteQueueById(row.Id, ct);
+                return "printed";
+            }
+
+            if (string.IsNullOrWhiteSpace(row.PayloadJson))
+            {
+                await DeleteQueueById(row.Id, ct);
+                return "cleared";
+            }
+
+            var payload = JsonSerializer.Deserialize<KitchenAdjustmentQueuePayload>(row.PayloadJson, JsonOptions);
+            if (payload is null || payload.ItemId == Guid.Empty)
+            {
+                await TouchQueueFailure(row.Id, "Invalid kitchen adjustment payload", ct);
+                return "failed";
+            }
+
+            var adjustmentTicket = await BuildKitchenAdjustmentTicketBytes(
+                row.OrderId,
+                payload.ItemId,
+                payload.ChangeType,
+                payload.QtyDelta,
+                payload.NewQty,
+                payload.Reason,
+                payload.Language,
+                ct);
+            await SendToNetworkPrinter(printer.Address!, adjustmentTicket, ct);
             await DeleteQueueById(row.Id, ct);
             return "printed";
         }
@@ -518,12 +691,24 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         await db.SaveChangesAsync(ct);
     }
 
-    private async Task QueuePrint(Guid orderId, Guid printerId, string kind, string? error, CancellationToken ct)
+    private async Task QueuePrint(
+        Guid orderId,
+        Guid printerId,
+        string kind,
+        string? error,
+        CancellationToken ct,
+        string? payloadJson = null)
     {
         var err = string.IsNullOrWhiteSpace(error) ? null : error.Trim();
-        var existing = await db.PrintQueue
-            .Where(x => x.OrderId == orderId && x.PrinterId == printerId && x.Kind == kind && x.Status == "pending")
-            .ToListAsync(ct);
+        var normalizedKind = string.IsNullOrWhiteSpace(kind) ? "kitchen" : kind.Trim().ToLowerInvariant();
+        var normalizedPayload = string.IsNullOrWhiteSpace(payloadJson) ? null : payloadJson.Trim();
+
+        var shouldDeduplicate = !string.Equals(normalizedKind, "kitchen_adjustment", StringComparison.OrdinalIgnoreCase);
+        var existing = shouldDeduplicate
+            ? await db.PrintQueue
+                .Where(x => x.OrderId == orderId && x.PrinterId == printerId && x.Kind == normalizedKind && x.Status == "pending")
+                .ToListAsync(ct)
+            : [];
 
         var now = DateTime.UtcNow;
         if (existing.Count > 0)
@@ -532,6 +717,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             {
                 row.Attempts += 1;
                 row.LastError = err;
+                row.PayloadJson = normalizedPayload;
                 row.UpdatedAt = now;
             }
 
@@ -544,21 +730,36 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             Id = Guid.NewGuid(),
             OrderId = orderId,
             PrinterId = printerId,
-            Kind = kind,
+            Kind = normalizedKind,
             Status = "pending",
             Attempts = 1,
             LastError = err,
+            PayloadJson = normalizedPayload,
             CreatedAt = now,
             UpdatedAt = now,
         });
         await db.SaveChangesAsync(ct);
     }
 
-    private async Task ClearQueuedPrint(Guid orderId, Guid printerId, string kind, CancellationToken ct)
+    private async Task ClearQueuedPrint(
+        Guid orderId,
+        Guid printerId,
+        string kind,
+        CancellationToken ct,
+        string? payloadJson = null)
     {
-        var rows = await db.PrintQueue
-            .Where(x => x.OrderId == orderId && x.PrinterId == printerId && x.Kind == kind)
-            .ToListAsync(ct);
+        var normalizedKind = string.IsNullOrWhiteSpace(kind) ? "kitchen" : kind.Trim().ToLowerInvariant();
+        var normalizedPayload = string.IsNullOrWhiteSpace(payloadJson) ? null : payloadJson.Trim();
+
+        var query = db.PrintQueue
+            .Where(x => x.OrderId == orderId && x.PrinterId == printerId && x.Kind == normalizedKind);
+        if (string.Equals(normalizedKind, "kitchen_adjustment", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(normalizedPayload))
+        {
+            query = query.Where(x => x.PayloadJson == normalizedPayload);
+        }
+
+        var rows = await query.ToListAsync(ct);
         if (rows.Count == 0)
         {
             return;
@@ -570,6 +771,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
 
     private async Task<byte[]> BuildKitchenTicketBytes(Guid orderId, IReadOnlyList<Guid> itemIds, string? language, CancellationToken ct)
     {
+        var template = await LoadKitchenTicketTemplateSettings(ct);
         var order = await (
             from o in db.Orders.AsNoTracking()
             join t in db.Tables.AsNoTracking() on o.TableId equals t.Id into tables
@@ -622,39 +824,264 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         var peopleLabel = isArabic ? "الأشخاص" : "People";
         var timeLabel = isArabic ? "الوقت" : "Time";
         var noteLabel = isArabic ? "ملاحظة" : "Note";
-        var title = isArabic ? $"طلب مطبخ #{order.OrderNo:00}" : $"KITCHEN ORDER #{order.OrderNo:00}";
+        var itemsLabel = isArabic ? "الأصناف" : "Items";
+        var titleRaw = isArabic ? template.KitchenOrderTitleAr : template.KitchenOrderTitleEn;
         var tableValue = order.IsTakeaway ? takeawayLabel : (order.TableName ?? "-");
+        var layoutVariant = (template.LayoutVariant ?? string.Empty).Trim().ToLowerInvariant();
+        var isCompactLayout = string.Equals(layoutVariant, "compact", StringComparison.OrdinalIgnoreCase);
+        var isMinimalLayout = string.Equals(layoutVariant, "minimal", StringComparison.OrdinalIgnoreCase);
 
         var sb = new StringBuilder();
-        sb.AppendLine(title);
-        sb.AppendLine($"{tableLabel}: {tableValue}");
-        if (order.PeopleCount.HasValue)
+        if (isMinimalLayout)
         {
-            sb.AppendLine($"{peopleLabel}: {order.PeopleCount}");
+            sb.AppendLine($"{titleRaw} #{order.OrderNo:00}");
+            sb.AppendLine(BuildTicketPairLine(tableValue, $"{order.CreatedAt:HH:mm}"));
+            sb.AppendLine(new string('-', Paper80LineWidth));
         }
-        sb.AppendLine($"{timeLabel}: {order.CreatedAt:yyyy-MM-dd HH:mm:ss}");
-        sb.AppendLine(new string('-', Paper80LineWidth));
+        else if (isCompactLayout)
+        {
+            sb.AppendLine($"{titleRaw} #{order.OrderNo:00}");
+            sb.AppendLine(BuildTicketPairLine($"{tableLabel}:", tableValue));
+            sb.AppendLine(BuildTicketPairLine($"{timeLabel}:", $"{order.CreatedAt:HH:mm:ss}"));
+            sb.AppendLine(new string('-', Paper80LineWidth));
+        }
+        else
+        {
+            sb.AppendLine(CenterTicketText(titleRaw));
+            sb.AppendLine(CenterTicketText($"#{order.OrderNo:00}"));
+            sb.AppendLine(new string('=', Paper80LineWidth));
+            sb.AppendLine(BuildTicketPairLine($"{tableLabel}:", tableValue));
+            if (order.PeopleCount.HasValue)
+            {
+                sb.AppendLine(BuildTicketPairLine($"{peopleLabel}:", order.PeopleCount.Value.ToString()));
+            }
+            sb.AppendLine(BuildTicketPairLine($"{timeLabel}:", $"{order.CreatedAt:yyyy-MM-dd HH:mm:ss}"));
+            sb.AppendLine(BuildTicketPairLine($"{itemsLabel}:", items.Count.ToString()));
+            sb.AppendLine(new string('-', Paper80LineWidth));
+        }
 
+        var itemIndex = 1;
         foreach (var item in items)
         {
-            sb.AppendLine($"{item.Name} x{(double)item.Qty:0.###}");
-            if (!string.IsNullOrWhiteSpace(item.Note))
-            {
-                sb.AppendLine($"  {noteLabel}: {item.Note}");
-            }
-
+            AppendTicketItemLine(
+                sb,
+                $"{itemIndex}. {item.Name}",
+                $"x{(double)item.Qty:0.###}");
             if (byItem.TryGetValue(item.Id, out var list))
             {
                 foreach (var c in list)
                 {
-                    sb.AppendLine($"  + {c}");
+                    AppendTicketWrappedLine(sb, "  + ", c);
                 }
+            }
+
+            if (!string.IsNullOrWhiteSpace(item.Note))
+            {
+                AppendTicketWrappedLine(
+                    sb,
+                    isMinimalLayout ? "  ! " : $"  {noteLabel}: ",
+                    item.Note);
+            }
+
+            if (!isCompactLayout && !isMinimalLayout)
+            {
+                sb.AppendLine(new string('-', Paper80LineWidth));
+            }
+            itemIndex += 1;
+        }
+
+        if (isCompactLayout || isMinimalLayout)
+        {
+            sb.AppendLine(new string('-', Paper80LineWidth));
+        }
+
+        if (!string.IsNullOrWhiteSpace(template.FooterNote))
+        {
+            sb.AppendLine(new string('-', Paper80LineWidth));
+            foreach (var line in WrapTicketText(template.FooterNote, Paper80LineWidth))
+            {
+                sb.AppendLine(CenterTicketText(line));
             }
         }
 
         sb.AppendLine();
         sb.AppendLine();
 
+        return WrapEscPosText(sb.ToString());
+    }
+
+    private async Task<byte[]> BuildKitchenAdjustmentTicketBytes(
+        Guid orderId,
+        Guid itemId,
+        string? changeType,
+        double? qtyDelta,
+        double? newQty,
+        string? reason,
+        string? language,
+        CancellationToken ct)
+    {
+        var template = await LoadKitchenTicketTemplateSettings(ct);
+        var order = await (
+            from o in db.Orders.AsNoTracking()
+            join t in db.Tables.AsNoTracking() on o.TableId equals t.Id into tables
+            from t in tables.DefaultIfEmpty()
+            where o.Id == orderId
+            select new
+            {
+                o.OrderNo,
+                o.IsTakeaway,
+                TableName = t != null ? t.Name : null,
+                o.PeopleCount,
+                o.CreatedAt,
+            }).FirstOrDefaultAsync(ct);
+        if (order is null)
+        {
+            throw new PosNotFoundException("ORDER_NOT_FOUND");
+        }
+
+        var item = await db.OrderItems
+            .AsNoTracking()
+            .Where(x => x.Id == itemId && x.OrderId == orderId)
+            .Select(x => new
+            {
+                x.Id,
+                x.Name,
+                x.Qty,
+                x.Note,
+                x.VoidReason,
+                x.Voided,
+            })
+            .FirstOrDefaultAsync(ct);
+        if (item is null)
+        {
+            throw new PosNotFoundException("ORDER_ITEM_NOT_FOUND");
+        }
+
+        var customizations = await db.OrderItemCustomizations
+            .AsNoTracking()
+            .Where(x => x.OrderItemId == itemId)
+            .OrderBy(x => x.CreatedAt)
+            .Select(x => new
+            {
+                x.OptionName,
+                x.Qty,
+            })
+            .ToListAsync(ct);
+
+        var isArabic = IsArabicLanguage(language);
+        var takeawayLabel = isArabic ? "سفري" : "Takeaway";
+        var tableLabel = isArabic ? "الطاولة" : "Table";
+        var peopleLabel = isArabic ? "الأشخاص" : "People";
+        var timeLabel = isArabic ? "الوقت" : "Time";
+        var noteLabel = isArabic ? "ملاحظة" : "Note";
+        var reasonLabel = isArabic ? "السبب" : "Reason";
+        var changeLabel = isArabic ? "التغيير" : "Change";
+        var newQtyLabel = isArabic ? "الكمية الجديدة" : "New Qty";
+        var titleRaw = isArabic ? template.KitchenUpdateTitleAr : template.KitchenUpdateTitleEn;
+        var tableValue = order.IsTakeaway ? takeawayLabel : (order.TableName ?? "-");
+        var layoutVariant = (template.LayoutVariant ?? string.Empty).Trim().ToLowerInvariant();
+        var isCompactLayout = string.Equals(layoutVariant, "compact", StringComparison.OrdinalIgnoreCase);
+        var isMinimalLayout = string.Equals(layoutVariant, "minimal", StringComparison.OrdinalIgnoreCase);
+
+        var normalizedType = (changeType ?? string.Empty).Trim().ToLowerInvariant();
+        var changeValue = normalizedType switch
+        {
+            "void" or "voided" => isArabic ? "إلغاء صنف" : "VOID ITEM",
+            "qty_add" => isArabic ? "زيادة كمية" : "QTY INCREASE",
+            "qty_remove" => isArabic ? "تقليل كمية" : "QTY DECREASE",
+            "qty_changed" => isArabic ? "تعديل كمية" : "QTY CHANGED",
+            _ => isArabic ? "تحديث صنف" : "ITEM UPDATED",
+        };
+
+        var sb = new StringBuilder();
+        if (isMinimalLayout)
+        {
+            sb.AppendLine($"{titleRaw} #{order.OrderNo:00}");
+            sb.AppendLine($"[{changeValue}]");
+            sb.AppendLine(BuildTicketPairLine(tableValue, $"{DateTime.UtcNow:HH:mm:ss}"));
+            sb.AppendLine(new string('-', Paper80LineWidth));
+        }
+        else if (isCompactLayout)
+        {
+            sb.AppendLine($"{titleRaw} #{order.OrderNo:00}");
+            sb.AppendLine($"[{changeValue}]");
+            sb.AppendLine(BuildTicketPairLine($"{tableLabel}:", tableValue));
+            sb.AppendLine(BuildTicketPairLine($"{timeLabel}:", $"{DateTime.UtcNow:HH:mm:ss}"));
+            sb.AppendLine(new string('-', Paper80LineWidth));
+        }
+        else
+        {
+            sb.AppendLine(CenterTicketText(titleRaw));
+            sb.AppendLine(CenterTicketText($"#{order.OrderNo:00}"));
+            sb.AppendLine(new string('=', Paper80LineWidth));
+            sb.AppendLine(CenterTicketText($"[{changeValue}]"));
+            sb.AppendLine(new string('-', Paper80LineWidth));
+            sb.AppendLine(BuildTicketPairLine($"{tableLabel}:", tableValue));
+            if (order.PeopleCount.HasValue)
+            {
+                sb.AppendLine(BuildTicketPairLine($"{peopleLabel}:", order.PeopleCount.Value.ToString()));
+            }
+            sb.AppendLine(BuildTicketPairLine($"{timeLabel}:", $"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}"));
+            sb.AppendLine(new string('-', Paper80LineWidth));
+        }
+        sb.AppendLine(BuildTicketPairLine($"{changeLabel}:", changeValue));
+        AppendTicketItemLine(
+            sb,
+            item.Name,
+            $"x{(double)item.Qty:0.###}");
+        if (qtyDelta.HasValue && Math.Abs(qtyDelta.Value) > 0.0001d)
+        {
+            AppendTicketWrappedLine(sb, "  Δ ", $"{qtyDelta.Value:+0.###;-0.###}");
+        }
+
+        if (newQty.HasValue)
+        {
+            AppendTicketWrappedLine(
+                sb,
+                isMinimalLayout ? "  => " : $"  {newQtyLabel}: ",
+                $"{newQty.Value:0.###}");
+        }
+
+        var cleanReason = string.IsNullOrWhiteSpace(reason)
+            ? (string.IsNullOrWhiteSpace(item.VoidReason) ? null : item.VoidReason.Trim())
+            : reason.Trim();
+        if (!string.IsNullOrWhiteSpace(cleanReason))
+        {
+            AppendTicketWrappedLine(
+                sb,
+                isMinimalLayout ? "  R: " : $"  {reasonLabel}: ",
+                cleanReason);
+        }
+
+        if (!string.IsNullOrWhiteSpace(item.Note))
+        {
+            AppendTicketWrappedLine(
+                sb,
+                isMinimalLayout ? "  ! " : $"  {noteLabel}: ",
+                item.Note.Trim());
+        }
+
+        foreach (var row in customizations)
+        {
+            AppendTicketWrappedLine(sb, "  + ", $"{row.OptionName} x{(double)row.Qty:0.###}");
+        }
+
+        if (isCompactLayout || isMinimalLayout)
+        {
+            sb.AppendLine(new string('-', Paper80LineWidth));
+        }
+
+        if (!string.IsNullOrWhiteSpace(template.FooterNote))
+        {
+            sb.AppendLine(new string('-', Paper80LineWidth));
+            foreach (var line in WrapTicketText(template.FooterNote, Paper80LineWidth))
+            {
+                sb.AppendLine(CenterTicketText(line));
+            }
+        }
+
+        sb.AppendLine();
+        sb.AppendLine();
         return WrapEscPosText(sb.ToString());
     }
 
@@ -923,6 +1350,66 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         return WrapEscPosText(sb.ToString());
     }
 
+    private async Task<KitchenTicketTemplateSettings> LoadKitchenTicketTemplateSettings(CancellationToken ct)
+    {
+        var raw = await db.AppSettings.AsNoTracking()
+            .Where(x => x.Key == PosSettingKeys.KitchenTicketTemplateConfig)
+            .Select(x => x.Value)
+            .FirstOrDefaultAsync(ct);
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return DefaultKitchenTicketTemplateSettings();
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Deserialize<KitchenTicketTemplatePayload>(raw, JsonOptions);
+            return NormalizeKitchenTicketTemplate(payload);
+        }
+        catch
+        {
+            return DefaultKitchenTicketTemplateSettings();
+        }
+    }
+
+    private static KitchenTicketTemplateSettings DefaultKitchenTicketTemplateSettings() => new(
+        KitchenOrderTitleEn: "KITCHEN ORDER",
+        KitchenOrderTitleAr: "طلب مطبخ",
+        KitchenUpdateTitleEn: "KITCHEN UPDATE",
+        KitchenUpdateTitleAr: "تحديث مطبخ",
+        LayoutVariant: "detailed",
+        FooterNote: null);
+
+    private static KitchenTicketTemplateSettings NormalizeKitchenTicketTemplate(KitchenTicketTemplatePayload? payload)
+    {
+        var defaults = DefaultKitchenTicketTemplateSettings();
+        if (payload is null)
+        {
+            return defaults;
+        }
+
+        return new KitchenTicketTemplateSettings(
+            KitchenOrderTitleEn: NormalizeRequiredText(payload.KitchenOrderTitleEn, defaults.KitchenOrderTitleEn),
+            KitchenOrderTitleAr: NormalizeRequiredText(payload.KitchenOrderTitleAr, defaults.KitchenOrderTitleAr),
+            KitchenUpdateTitleEn: NormalizeRequiredText(payload.KitchenUpdateTitleEn, defaults.KitchenUpdateTitleEn),
+            KitchenUpdateTitleAr: NormalizeRequiredText(payload.KitchenUpdateTitleAr, defaults.KitchenUpdateTitleAr),
+            LayoutVariant: NormalizeKitchenLayoutVariant(payload.LayoutVariant, defaults.LayoutVariant),
+            FooterNote: NormalizeOptionalText(payload.FooterNote));
+    }
+
+    private static string NormalizeKitchenLayoutVariant(string? raw, string fallback)
+    {
+        var value = raw?.Trim().ToLowerInvariant();
+        return value switch
+        {
+            "compact" => "compact",
+            "detailed" => "detailed",
+            "minimal" => "minimal",
+            _ => fallback,
+        };
+    }
+
     private async Task<InvoiceTemplateSettings> LoadInvoiceTemplateSettings(CancellationToken ct)
     {
         var raw = await db.AppSettings.AsNoTracking()
@@ -1123,6 +1610,146 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
     private static bool IsArabicLanguage(string? language)
         => !string.IsNullOrWhiteSpace(language) &&
            language.Trim().StartsWith("ar", StringComparison.OrdinalIgnoreCase);
+
+    private static void AppendTicketItemLine(StringBuilder sb, string itemText, string qtyText)
+    {
+        var cleanQty = NormalizeTicketInline(qtyText);
+        var leftWidth = string.IsNullOrWhiteSpace(cleanQty)
+            ? Paper80LineWidth
+            : Math.Max(8, Paper80LineWidth - cleanQty.Length - 1);
+        var wrapped = WrapTicketText(itemText, leftWidth);
+        if (wrapped.Count == 0)
+        {
+            wrapped.Add("-");
+        }
+
+        if (string.IsNullOrWhiteSpace(cleanQty))
+        {
+            sb.AppendLine(wrapped[0]);
+        }
+        else
+        {
+            sb.AppendLine(BuildTicketPairLine(wrapped[0], cleanQty));
+        }
+
+        for (var i = 1; i < wrapped.Count; i += 1)
+        {
+            sb.AppendLine($"  {wrapped[i]}");
+        }
+    }
+
+    private static void AppendTicketWrappedLine(StringBuilder sb, string prefix, string value)
+    {
+        var cleanPrefix = NormalizeTicketInline(prefix);
+        var wrapWidth = Math.Max(8, Paper80LineWidth - cleanPrefix.Length);
+        var wrapped = WrapTicketText(value, wrapWidth);
+        if (wrapped.Count == 0)
+        {
+            return;
+        }
+
+        sb.AppendLine($"{cleanPrefix}{wrapped[0]}");
+        var indent = new string(' ', cleanPrefix.Length);
+        for (var i = 1; i < wrapped.Count; i += 1)
+        {
+            sb.AppendLine($"{indent}{wrapped[i]}");
+        }
+    }
+
+    private static string BuildTicketPairLine(string left, string right)
+    {
+        var cleanLeft = NormalizeTicketInline(left);
+        var cleanRight = NormalizeTicketInline(right);
+        if (string.IsNullOrWhiteSpace(cleanRight))
+        {
+            return cleanLeft;
+        }
+
+        if (cleanRight.Length >= Paper80LineWidth)
+        {
+            cleanRight = cleanRight[(cleanRight.Length - (Paper80LineWidth - 1))..];
+        }
+
+        var leftWidth = Math.Max(0, Paper80LineWidth - cleanRight.Length - 1);
+        if (cleanLeft.Length > leftWidth)
+        {
+            cleanLeft = cleanLeft[..leftWidth];
+        }
+
+        return $"{cleanLeft.PadRight(leftWidth)} {cleanRight}";
+    }
+
+    private static string CenterTicketText(string value)
+    {
+        var clean = NormalizeTicketInline(value);
+        if (string.IsNullOrWhiteSpace(clean))
+        {
+            return string.Empty;
+        }
+
+        if (clean.Length >= Paper80LineWidth)
+        {
+            return clean[..Paper80LineWidth];
+        }
+
+        var leftPadding = (Paper80LineWidth - clean.Length) / 2;
+        return $"{new string(' ', leftPadding)}{clean}";
+    }
+
+    private static List<string> WrapTicketText(string? value, int width)
+    {
+        var lines = new List<string>();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return lines;
+        }
+
+        var maxWidth = Math.Max(1, width);
+        foreach (var part in value.Replace("\r", string.Empty).Split('\n'))
+        {
+            var remaining = part.Trim();
+            while (!string.IsNullOrEmpty(remaining))
+            {
+                if (remaining.Length <= maxWidth)
+                {
+                    lines.Add(remaining);
+                    break;
+                }
+
+                var candidate = remaining[..maxWidth];
+                var split = candidate.LastIndexOf(' ');
+                if (split <= 0)
+                {
+                    split = maxWidth;
+                }
+
+                var chunk = remaining[..split].TrimEnd();
+                if (chunk.Length == 0)
+                {
+                    chunk = remaining[..maxWidth];
+                    split = maxWidth;
+                }
+
+                lines.Add(chunk);
+                remaining = remaining[split..].TrimStart();
+            }
+        }
+
+        return lines;
+    }
+
+    private static string NormalizeTicketInline(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        return value
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+    }
 
     private static byte[] WrapEscPosText(string text)
     {

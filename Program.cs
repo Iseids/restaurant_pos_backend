@@ -43,6 +43,7 @@ await EnsureOrderNicknameColumnAsync(app, app.Lifetime.ApplicationStopping);
 await EnsureAuditLogsTableAsync(app, app.Lifetime.ApplicationStopping);
 await EnsureAccountingLinksColumnsAsync(app, app.Lifetime.ApplicationStopping);
 await EnsureSystemAccountsColumnsAsync(app, app.Lifetime.ApplicationStopping);
+await EnsurePrintQueuePayloadColumnAsync(app, app.Lifetime.ApplicationStopping);
 await EnsureSystemAccountsBootstrapAsync(app, app.Lifetime.ApplicationStopping);
 
 if (app.Environment.IsDevelopment())
@@ -365,7 +366,7 @@ app.MapDelete("/api/orders/{id:guid}", async (HttpContext ctx, Guid id, OrdersSe
     }
 });
 
-app.MapPost("/api/orders/{id:guid}/items", async (HttpContext ctx, HttpRequest req, Guid id, OrdersService orders, CancellationToken ct) =>
+app.MapPost("/api/orders/{id:guid}/items", async (HttpContext ctx, HttpRequest req, Guid id, OrdersService orders, PrintService printService, CancellationToken ct) =>
 {
     if (ctx.RequireMinRole(PosRole.Service, out var user) is { } denied)
     {
@@ -376,6 +377,7 @@ app.MapPost("/api/orders/{id:guid}/items", async (HttpContext ctx, HttpRequest r
     var menuItemId = GetGuid(payload, "menuItemId");
     var qty = GetDouble(payload, "qty") ?? 1;
     var note = GetString(payload, "note")?.Trim();
+    var language = GetString(payload, "language");
     var customizations = ParseCustomizations(payload.TryGetValue("customizations", out var customEl) ? customEl : default);
 
     if (!menuItemId.HasValue)
@@ -386,7 +388,18 @@ app.MapPost("/api/orders/{id:guid}/items", async (HttpContext ctx, HttpRequest r
     try
     {
         var result = await orders.AddItem(id, user!.Id, menuItemId.Value, qty, note, customizations, ct);
-        return ApiResults.Ok(result, StatusCodes.Status201Created);
+        object? kitchen = null;
+        if (result.ShouldNotifyKitchen)
+        {
+            kitchen = await printService.PrintKitchenForOrder(id, language, ct);
+        }
+
+        return ApiResults.Ok(new
+        {
+            itemId = result.ItemId,
+            qty = result.Qty,
+            kitchen,
+        }, StatusCodes.Status201Created);
     }
     catch (PosNotFoundException)
     {
@@ -398,7 +411,7 @@ app.MapPost("/api/orders/{id:guid}/items", async (HttpContext ctx, HttpRequest r
     }
 });
 
-app.MapPatch("/api/orders/items/{itemId:guid}", async (HttpContext ctx, HttpRequest req, Guid itemId, OrdersService orders, CancellationToken ct) =>
+app.MapPatch("/api/orders/items/{itemId:guid}", async (HttpContext ctx, HttpRequest req, Guid itemId, OrdersService orders, PrintService printService, CancellationToken ct) =>
 {
     if (ctx.RequireMinRole(PosRole.Service, out var user) is { } denied)
     {
@@ -406,6 +419,7 @@ app.MapPatch("/api/orders/items/{itemId:guid}", async (HttpContext ctx, HttpRequ
     }
 
     var payload = await ReadJsonMap(req, ct);
+    var language = GetString(payload, "language");
 
     var hasDiscount = payload.ContainsKey("discountAmount") || payload.ContainsKey("discountPercent");
     if (hasDiscount && user!.Role < PosRole.Cashier)
@@ -427,8 +441,23 @@ app.MapPatch("/api/orders/items/{itemId:guid}", async (HttpContext ctx, HttpRequ
 
     try
     {
-        await orders.UpdateItem(itemId, user!.Id, patch, ct);
-        return ApiResults.Ok(new { ok = true });
+        var result = await orders.UpdateItem(itemId, user!.Id, patch, ct);
+        object? kitchen = null;
+        if (result.ShouldNotifyKitchen)
+        {
+            var changeType = result.QtyDelta > 0 ? "qty_add" : "qty_remove";
+            kitchen = await printService.PrintKitchenItemAdjustment(
+                result.OrderId,
+                result.ItemId,
+                changeType,
+                result.QtyDelta,
+                result.NewQty,
+                null,
+                language,
+                ct);
+        }
+
+        return ApiResults.Ok(new { ok = true, kitchen });
     }
     catch (PosNotFoundException)
     {
@@ -440,7 +469,7 @@ app.MapPatch("/api/orders/items/{itemId:guid}", async (HttpContext ctx, HttpRequ
     }
 });
 
-app.MapPost("/api/orders/items/{itemId:guid}/void", async (HttpContext ctx, HttpRequest req, Guid itemId, OrdersService orders, CancellationToken ct) =>
+app.MapPost("/api/orders/items/{itemId:guid}/void", async (HttpContext ctx, HttpRequest req, Guid itemId, OrdersService orders, PrintService printService, CancellationToken ct) =>
 {
     if (ctx.RequireMinRole(PosRole.Cashier, out var user) is { } denied)
     {
@@ -449,6 +478,7 @@ app.MapPost("/api/orders/items/{itemId:guid}/void", async (HttpContext ctx, Http
 
     var payload = await ReadJsonMap(req, ct);
     var reason = GetString(payload, "reason")?.Trim() ?? string.Empty;
+    var language = GetString(payload, "language");
     if (string.IsNullOrEmpty(reason))
     {
         return ApiResults.Error(StatusCodes.Status400BadRequest, "BAD_REQUEST", "reason required");
@@ -456,8 +486,22 @@ app.MapPost("/api/orders/items/{itemId:guid}/void", async (HttpContext ctx, Http
 
     try
     {
-        await orders.VoidItem(itemId, user!.Id, reason, ct);
-        return ApiResults.Ok(new { ok = true });
+        var result = await orders.VoidItem(itemId, user!.Id, reason, ct);
+        object? kitchen = null;
+        if (result.ShouldNotifyKitchen)
+        {
+            kitchen = await printService.PrintKitchenItemAdjustment(
+                result.OrderId,
+                result.ItemId,
+                "void",
+                -result.Qty,
+                0,
+                reason,
+                language,
+                ct);
+        }
+
+        return ApiResults.Ok(new { ok = true, kitchen });
     }
     catch (PosNotFoundException)
     {
@@ -1301,6 +1345,36 @@ app.MapPut("/api/admin/settings/invoice-template", async (HttpContext ctx, HttpR
         GetString(payload, "layoutVariant"),
         GetBool(payload, "showLogo"),
         GetBool(payload, "showPaymentsSection"),
+        ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapGet("/api/admin/settings/kitchen-ticket-template", async (HttpContext ctx, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var item = await admin.GetKitchenTicketTemplateSettings(ct);
+    return ApiResults.Ok(new { item });
+});
+
+app.MapPut("/api/admin/settings/kitchen-ticket-template", async (HttpContext ctx, HttpRequest req, AdminService admin, CancellationToken ct) =>
+{
+    if (ctx.RequireMinRole(PosRole.Admin, out _) is { } denied)
+    {
+        return denied;
+    }
+
+    var payload = await ReadJsonMap(req, ct);
+    var item = await admin.SetKitchenTicketTemplateSettings(
+        GetString(payload, "kitchenOrderTitleEn"),
+        GetString(payload, "kitchenOrderTitleAr"),
+        GetString(payload, "kitchenUpdateTitleEn"),
+        GetString(payload, "kitchenUpdateTitleAr"),
+        GetString(payload, "layoutVariant"),
+        GetString(payload, "footerNote"),
         ct);
     return ApiResults.Ok(new { item });
 });
@@ -3621,6 +3695,18 @@ static async Task EnsureSystemAccountsColumnsAsync(WebApplication app, Cancellat
 
         CREATE UNIQUE INDEX IF NOT EXISTS ux_pos_account_relations_from_to_kind
         ON pos_account_relations (from_account_id, to_account_id, kind);
+        """,
+        ct);
+}
+
+static async Task EnsurePrintQueuePayloadColumnAsync(WebApplication app, CancellationToken ct)
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<PosDbContext>();
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        ALTER TABLE IF EXISTS pos_print_queue
+        ADD COLUMN IF NOT EXISTS payload_json text NULL;
         """,
         ct);
 }

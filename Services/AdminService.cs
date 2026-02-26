@@ -36,6 +36,14 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         bool ShowLogo,
         bool ShowPaymentsSection);
 
+    private sealed record KitchenTicketTemplateSettingsSnapshot(
+        string KitchenOrderTitleEn,
+        string KitchenOrderTitleAr,
+        string KitchenUpdateTitleEn,
+        string KitchenUpdateTitleAr,
+        string LayoutVariant,
+        string? FooterNote);
+
     private sealed class CurrencyEntryPayload
     {
         public string? Code { get; set; }
@@ -62,6 +70,16 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         public string? LayoutVariant { get; set; }
         public bool? ShowLogo { get; set; }
         public bool? ShowPaymentsSection { get; set; }
+    }
+
+    private sealed class KitchenTicketTemplatePayload
+    {
+        public string? KitchenOrderTitleEn { get; set; }
+        public string? KitchenOrderTitleAr { get; set; }
+        public string? KitchenUpdateTitleEn { get; set; }
+        public string? KitchenUpdateTitleAr { get; set; }
+        public string? LayoutVariant { get; set; }
+        public string? FooterNote { get; set; }
     }
 
     public async Task<object> GetPrinterSettings(CancellationToken ct)
@@ -389,6 +407,50 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         await db.SaveChangesAsync(ct);
 
         return ToInvoiceTemplateSettingsJson(snapshot);
+    }
+
+    public async Task<object> GetKitchenTicketTemplateSettings(CancellationToken ct)
+    {
+        var snapshot = await LoadKitchenTicketTemplateSettings(ct);
+        return ToKitchenTicketTemplateSettingsJson(snapshot);
+    }
+
+    public async Task<object> SetKitchenTicketTemplateSettings(
+        string? kitchenOrderTitleEn,
+        string? kitchenOrderTitleAr,
+        string? kitchenUpdateTitleEn,
+        string? kitchenUpdateTitleAr,
+        string? layoutVariant,
+        string? footerNote,
+        CancellationToken ct)
+    {
+        var snapshot = NormalizeKitchenTicketTemplate(new KitchenTicketTemplatePayload
+        {
+            KitchenOrderTitleEn = kitchenOrderTitleEn,
+            KitchenOrderTitleAr = kitchenOrderTitleAr,
+            KitchenUpdateTitleEn = kitchenUpdateTitleEn,
+            KitchenUpdateTitleAr = kitchenUpdateTitleAr,
+            LayoutVariant = layoutVariant,
+            FooterNote = footerNote,
+        });
+
+        await UpsertSetting(
+            PosSettingKeys.KitchenTicketTemplateConfig,
+            JsonSerializer.Serialize(
+                new KitchenTicketTemplatePayload
+                {
+                    KitchenOrderTitleEn = snapshot.KitchenOrderTitleEn,
+                    KitchenOrderTitleAr = snapshot.KitchenOrderTitleAr,
+                    KitchenUpdateTitleEn = snapshot.KitchenUpdateTitleEn,
+                    KitchenUpdateTitleAr = snapshot.KitchenUpdateTitleAr,
+                    LayoutVariant = snapshot.LayoutVariant,
+                    FooterNote = snapshot.FooterNote,
+                },
+                JsonOptions),
+            ct);
+        await db.SaveChangesAsync(ct);
+
+        return ToKitchenTicketTemplateSettingsJson(snapshot);
     }
 
     public async Task<List<object>> ListPrinters(CancellationToken ct)
@@ -1448,6 +1510,80 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             LayoutVariant: NormalizeLayoutVariant(payload.LayoutVariant, defaults.LayoutVariant),
             ShowLogo: payload.ShowLogo ?? defaults.ShowLogo,
             ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection);
+    }
+
+    private async Task<KitchenTicketTemplateSettingsSnapshot> LoadKitchenTicketTemplateSettings(CancellationToken ct)
+    {
+        var raw = await db.AppSettings
+            .AsNoTracking()
+            .Where(x => x.Key == PosSettingKeys.KitchenTicketTemplateConfig)
+            .Select(x => x.Value)
+            .FirstOrDefaultAsync(ct);
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return DefaultKitchenTicketTemplateSettings();
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Deserialize<KitchenTicketTemplatePayload>(raw, JsonOptions);
+            return NormalizeKitchenTicketTemplate(payload);
+        }
+        catch
+        {
+            return DefaultKitchenTicketTemplateSettings();
+        }
+    }
+
+    private static object ToKitchenTicketTemplateSettingsJson(KitchenTicketTemplateSettingsSnapshot snapshot)
+    {
+        return new
+        {
+            kitchenOrderTitleEn = snapshot.KitchenOrderTitleEn,
+            kitchenOrderTitleAr = snapshot.KitchenOrderTitleAr,
+            kitchenUpdateTitleEn = snapshot.KitchenUpdateTitleEn,
+            kitchenUpdateTitleAr = snapshot.KitchenUpdateTitleAr,
+            layoutVariant = snapshot.LayoutVariant,
+            footerNote = snapshot.FooterNote,
+        };
+    }
+
+    private static KitchenTicketTemplateSettingsSnapshot DefaultKitchenTicketTemplateSettings() => new(
+        KitchenOrderTitleEn: "KITCHEN ORDER",
+        KitchenOrderTitleAr: "طلب مطبخ",
+        KitchenUpdateTitleEn: "KITCHEN UPDATE",
+        KitchenUpdateTitleAr: "تحديث مطبخ",
+        LayoutVariant: "detailed",
+        FooterNote: null);
+
+    private static KitchenTicketTemplateSettingsSnapshot NormalizeKitchenTicketTemplate(KitchenTicketTemplatePayload? payload)
+    {
+        var defaults = DefaultKitchenTicketTemplateSettings();
+        if (payload is null)
+        {
+            return defaults;
+        }
+
+        return new KitchenTicketTemplateSettingsSnapshot(
+            KitchenOrderTitleEn: NormalizeRequiredText(payload.KitchenOrderTitleEn, defaults.KitchenOrderTitleEn),
+            KitchenOrderTitleAr: NormalizeRequiredText(payload.KitchenOrderTitleAr, defaults.KitchenOrderTitleAr),
+            KitchenUpdateTitleEn: NormalizeRequiredText(payload.KitchenUpdateTitleEn, defaults.KitchenUpdateTitleEn),
+            KitchenUpdateTitleAr: NormalizeRequiredText(payload.KitchenUpdateTitleAr, defaults.KitchenUpdateTitleAr),
+            LayoutVariant: NormalizeKitchenLayoutVariant(payload.LayoutVariant, defaults.LayoutVariant),
+            FooterNote: NormalizeOptionalText(payload.FooterNote));
+    }
+
+    private static string NormalizeKitchenLayoutVariant(string? raw, string fallback)
+    {
+        var value = raw?.Trim().ToLowerInvariant();
+        return value switch
+        {
+            "compact" => "compact",
+            "detailed" => "detailed",
+            "minimal" => "minimal",
+            _ => fallback,
+        };
     }
 
     private static string NormalizeLayoutVariant(string? raw, string fallback)

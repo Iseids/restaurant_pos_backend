@@ -10,4 +10,5 @@ public static class PosSettingKeys
     public const string DefaultCurrencyCode = "default_currency_code";
     public const string CurrenciesConfig = "currencies_config";
     public const string InvoiceTemplateConfig = "invoice_template_config";
+    public const string KitchenTicketTemplateConfig = "kitchen_ticket_template_config";
 }

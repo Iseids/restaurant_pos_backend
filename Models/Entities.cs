@@ -514,6 +514,9 @@ public sealed class PosPrintQueue
     [Column("last_error")]
     public string? LastError { get; set; }
 
+    [Column("payload_json")]
+    public string? PayloadJson { get; set; }
+
     [Column("created_at")]
     public DateTime CreatedAt { get; set; }
 

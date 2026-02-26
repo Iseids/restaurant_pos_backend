@@ -487,8 +487,20 @@ public sealed class OrdersService(
         };
     }
 
-    public async Task<object> AddItem(Guid orderId, Guid createdBy, Guid menuItemId, double qty, string? note, List<CustomizationSelection>? customizations, CancellationToken ct)
+    public async Task<OrderAddItemResult> AddItem(
+        Guid orderId,
+        Guid createdBy,
+        Guid menuItemId,
+        double qty,
+        string? note,
+        List<CustomizationSelection>? customizations,
+        CancellationToken ct)
     {
+        if (qty <= 0)
+        {
+            throw new PosRuleException("QTY_INVALID");
+        }
+
         var menuRow = await (
             from m in db.MenuItems.AsNoTracking()
             join c in db.Categories.AsNoTracking() on m.CategoryId equals c.Id
@@ -504,44 +516,21 @@ public sealed class OrdersService(
         var cleanNote = string.IsNullOrWhiteSpace(note) ? null : note.Trim();
         var computed = await ComputeCustomizations(menuItemId, customizations ?? [], ct);
         var unitPrice = menuRow.Price + computed.PriceDelta;
-
-        var existing = await db.OrderItems
-            .FirstOrDefaultAsync(x => x.OrderId == orderId
-                && x.MenuItemId == menuItemId
-                && !x.Voided
-                && x.KitchenPrintedAt == null
-                && x.UnitPrice == unitPrice
-                && (x.Note ?? string.Empty) == (cleanNote ?? string.Empty)
-                && (x.CustomizationSignature ?? string.Empty) == (computed.Signature ?? string.Empty),
-                ct);
-
-        if (existing is not null)
+        var orderRow = await db.Orders
+            .AsNoTracking()
+            .Where(x => x.Id == orderId)
+            .Select(x => new { x.Id, x.Status })
+            .FirstOrDefaultAsync(ct);
+        if (orderRow is null)
         {
-            var previousQty = existing.Qty;
-            existing.Qty += (decimal)qty;
-            await db.SaveChangesAsync(ct);
-
-            await WriteOrderAuditAsync(
-                actorUserId: createdBy,
-                method: "POST",
-                path: $"/api/orders/{orderId}/items",
-                requestBody: new
-                {
-                    orderId,
-                    itemId = existing.Id,
-                    menuItemId,
-                    name = existing.Name,
-                    addedQty = qty,
-                    previousQty = (double)previousQty,
-                    newQty = (double)existing.Qty,
-                    note = cleanNote,
-                    customizationsCount = computed.Rows.Count,
-                },
-                responseBody: new { ok = true, action = "item_added_existing" },
-                ct);
-
-            return new { itemId = existing.Id, qty = (double)existing.Qty };
+            throw new PosNotFoundException("ORDER_NOT_FOUND");
         }
+
+        // Auto-kitchen notify only for existing, already-sent/open orders.
+        var shouldNotifyKitchen = string.Equals(orderRow.Status, "open", StringComparison.OrdinalIgnoreCase) &&
+                                  await db.OrderItems
+                                      .AsNoTracking()
+                                      .AnyAsync(x => x.OrderId == orderId && x.KitchenPrintedAt != null, ct);
 
         var item = new PosOrderItem
         {
@@ -602,10 +591,14 @@ public sealed class OrdersService(
             responseBody: new { ok = true, action = "item_added" },
             ct);
 
-        return new { itemId = item.Id, qty };
+        return new OrderAddItemResult(
+            OrderId: orderId,
+            ItemId: item.Id,
+            Qty: (double)item.Qty,
+            ShouldNotifyKitchen: shouldNotifyKitchen);
     }
 
-    public async Task UpdateItem(Guid itemId, Guid userId, ItemPatch patch, CancellationToken ct)
+    public async Task<ItemUpdateResult> UpdateItem(Guid itemId, Guid userId, ItemPatch patch, CancellationToken ct)
     {
         var item = await db.OrderItems.FirstOrDefaultAsync(x => x.Id == itemId, ct);
         if (item is null)
@@ -682,11 +675,14 @@ public sealed class OrdersService(
 
         await db.SaveChangesAsync(ct);
 
+        var qtyChanged = false;
+        var qtyDelta = 0d;
         if (patch.Qty.HasValue)
         {
-            var qtyDelta = (double)(item.Qty - previousQty);
+            qtyDelta = (double)(item.Qty - previousQty);
             if (Math.Abs(qtyDelta) > 0.0001d)
             {
+                qtyChanged = true;
                 var isAddition = qtyDelta > 0;
                 await WriteOrderAuditAsync(
                     actorUserId: userId,
@@ -707,9 +703,17 @@ public sealed class OrdersService(
                     ct);
             }
         }
+
+        return new ItemUpdateResult(
+            OrderId: item.OrderId,
+            ItemId: item.Id,
+            QtyChanged: qtyChanged,
+            QtyDelta: qtyDelta,
+            NewQty: (double)item.Qty,
+            ShouldNotifyKitchen: qtyChanged && item.KitchenPrintedAt.HasValue);
     }
 
-    public async Task VoidItem(Guid itemId, Guid userId, string reason, CancellationToken ct)
+    public async Task<VoidItemResult> VoidItem(Guid itemId, Guid userId, string reason, CancellationToken ct)
     {
         var item = await db.OrderItems.FirstOrDefaultAsync(x => x.Id == itemId, ct);
         if (item is null || item.Voided)
@@ -738,6 +742,12 @@ public sealed class OrdersService(
             },
             responseBody: new { ok = true, action = "item_voided" },
             ct);
+
+        return new VoidItemResult(
+            OrderId: item.OrderId,
+            ItemId: item.Id,
+            Qty: (double)item.Qty,
+            ShouldNotifyKitchen: item.KitchenPrintedAt.HasValue);
     }
 
     public async Task UpdateOrder(Guid orderId, OrderPatch patch, CancellationToken ct)
@@ -1768,6 +1778,26 @@ public sealed record OrderSummaryResult(Guid Id, string BusinessDate, string Ord
         };
     }
 }
+
+public sealed record OrderAddItemResult(
+    Guid OrderId,
+    Guid ItemId,
+    double Qty,
+    bool ShouldNotifyKitchen);
+
+public sealed record ItemUpdateResult(
+    Guid OrderId,
+    Guid ItemId,
+    bool QtyChanged,
+    double QtyDelta,
+    double NewQty,
+    bool ShouldNotifyKitchen);
+
+public sealed record VoidItemResult(
+    Guid OrderId,
+    Guid ItemId,
+    double Qty,
+    bool ShouldNotifyKitchen);
 
 public sealed record ItemPatch(
     double? Qty,
