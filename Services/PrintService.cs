@@ -13,7 +13,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
     private const int Paper80LineWidth = 48;
     private const byte EscPosCodePageWindows1256 = 50;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-    private static readonly double[] SupportedPaperWidthsMm = [58d, 80d, 112d, 148d];
+    private static readonly double[] SupportedPaperWidthsMm = [58d, 60d, 70d, 72d, 80d, 112d, 148d];
     private static readonly Encoding ArabicEscPosEncoding;
     private sealed record ActivePrinterRow(Guid Id, string Name, string Type, string? Address, bool IsActive);
     private sealed record InvoiceTemplateSettings(

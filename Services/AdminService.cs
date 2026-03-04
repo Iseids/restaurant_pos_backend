@@ -1528,7 +1528,7 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             ReceiptWidthMm: NormalizePaperWidthMm(payload.ReceiptWidthMm, defaults.ReceiptWidthMm));
     }
 
-    private static readonly double[] SupportedPaperWidthsMm = [58d, 80d, 112d, 148d];
+    private static readonly double[] SupportedPaperWidthsMm = [58d, 60d, 70d, 72d, 80d, 112d, 148d];
 
     private static double NormalizePaperWidthMm(double? raw, double fallback)
     {
