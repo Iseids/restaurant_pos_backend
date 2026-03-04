@@ -34,7 +34,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         string AccentColorHex,
         string LayoutVariant,
         bool ShowLogo,
-        bool ShowPaymentsSection);
+        bool ShowPaymentsSection,
+        double InvoiceWidthMm,
+        double ReceiptWidthMm);
 
     private sealed record KitchenTicketTemplateSettingsSnapshot(
         string KitchenOrderTitleEn,
@@ -70,6 +72,8 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         public string? LayoutVariant { get; set; }
         public bool? ShowLogo { get; set; }
         public bool? ShowPaymentsSection { get; set; }
+        public double? InvoiceWidthMm { get; set; }
+        public double? ReceiptWidthMm { get; set; }
     }
 
     private sealed class KitchenTicketTemplatePayload
@@ -358,6 +362,8 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         string? layoutVariant,
         bool? showLogo,
         bool? showPaymentsSection,
+        double? invoiceWidthMm,
+        double? receiptWidthMm,
         CancellationToken ct)
     {
         var snapshot = NormalizeInvoiceTemplate(new InvoiceTemplatePayload
@@ -378,6 +384,8 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             LayoutVariant = layoutVariant,
             ShowLogo = showLogo,
             ShowPaymentsSection = showPaymentsSection,
+            InvoiceWidthMm = invoiceWidthMm,
+            ReceiptWidthMm = receiptWidthMm,
         });
 
         await UpsertSetting(
@@ -401,6 +409,8 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
                     LayoutVariant = snapshot.LayoutVariant,
                     ShowLogo = snapshot.ShowLogo,
                     ShowPaymentsSection = snapshot.ShowPaymentsSection,
+                    InvoiceWidthMm = snapshot.InvoiceWidthMm,
+                    ReceiptWidthMm = snapshot.ReceiptWidthMm,
                 },
                 JsonOptions),
             ct);
@@ -1464,6 +1474,8 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             layoutVariant = snapshot.LayoutVariant,
             showLogo = snapshot.ShowLogo,
             showPaymentsSection = snapshot.ShowPaymentsSection,
+            invoiceWidthMm = snapshot.InvoiceWidthMm,
+            receiptWidthMm = snapshot.ReceiptWidthMm,
         };
     }
 
@@ -1483,7 +1495,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         AccentColorHex: "#14B8A6",
         LayoutVariant: "premium",
         ShowLogo: true,
-        ShowPaymentsSection: true);
+        ShowPaymentsSection: true,
+        InvoiceWidthMm: 80,
+        ReceiptWidthMm: 148);
 
     private static InvoiceTemplateSettingsSnapshot NormalizeInvoiceTemplate(InvoiceTemplatePayload? payload)
     {
@@ -1509,7 +1523,35 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             AccentColorHex: NormalizeHexColor(payload.AccentColorHex, defaults.AccentColorHex),
             LayoutVariant: NormalizeLayoutVariant(payload.LayoutVariant, defaults.LayoutVariant),
             ShowLogo: payload.ShowLogo ?? defaults.ShowLogo,
-            ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection);
+            ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection,
+            InvoiceWidthMm: NormalizePaperWidthMm(payload.InvoiceWidthMm, defaults.InvoiceWidthMm),
+            ReceiptWidthMm: NormalizePaperWidthMm(payload.ReceiptWidthMm, defaults.ReceiptWidthMm));
+    }
+
+    private static readonly double[] SupportedPaperWidthsMm = [58d, 80d, 112d, 148d];
+
+    private static double NormalizePaperWidthMm(double? raw, double fallback)
+    {
+        if (!raw.HasValue || double.IsNaN(raw.Value) || double.IsInfinity(raw.Value))
+        {
+            return fallback;
+        }
+
+        var target = raw.Value;
+        var closest = SupportedPaperWidthsMm[0];
+        var smallestDelta = Math.Abs(target - closest);
+        for (var i = 1; i < SupportedPaperWidthsMm.Length; i += 1)
+        {
+            var candidate = SupportedPaperWidthsMm[i];
+            var delta = Math.Abs(target - candidate);
+            if (delta < smallestDelta)
+            {
+                smallestDelta = delta;
+                closest = candidate;
+            }
+        }
+
+        return closest;
     }
 
     private async Task<KitchenTicketTemplateSettingsSnapshot> LoadKitchenTicketTemplateSettings(CancellationToken ct)

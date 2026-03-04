@@ -11,7 +11,10 @@ namespace ResPosBackend.Services;
 public sealed class PrintService(PosDbContext db, OrdersService orders)
 {
     private const int Paper80LineWidth = 48;
+    private const byte EscPosCodePageWindows1256 = 50;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly double[] SupportedPaperWidthsMm = [58d, 80d, 112d, 148d];
+    private static readonly Encoding ArabicEscPosEncoding;
     private sealed record ActivePrinterRow(Guid Id, string Name, string Type, string? Address, bool IsActive);
     private sealed record InvoiceTemplateSettings(
         string BusinessName,
@@ -25,7 +28,9 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         string InvoiceTitleAr,
         string ReceiptTitleEn,
         string ReceiptTitleAr,
-        bool ShowPaymentsSection);
+        bool ShowPaymentsSection,
+        double InvoiceWidthMm,
+        double ReceiptWidthMm);
     private sealed record KitchenTicketTemplateSettings(
         string KitchenOrderTitleEn,
         string KitchenOrderTitleAr,
@@ -48,6 +53,8 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         public string? ReceiptTitleEn { get; set; }
         public string? ReceiptTitleAr { get; set; }
         public bool? ShowPaymentsSection { get; set; }
+        public double? InvoiceWidthMm { get; set; }
+        public double? ReceiptWidthMm { get; set; }
     }
 
     private sealed class KitchenTicketTemplatePayload
@@ -68,6 +75,15 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         public double? NewQty { get; set; }
         public string? Reason { get; set; }
         public string? Language { get; set; }
+    }
+
+    static PrintService()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        ArabicEscPosEncoding = Encoding.GetEncoding(
+            1256,
+            EncoderFallback.ReplacementFallback,
+            DecoderFallback.ReplacementFallback);
     }
 
     public Task<object> PrintKitchenForOrder(Guid orderId, CancellationToken ct)
@@ -1149,38 +1165,53 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         var total = ToDouble(totals.TryGetValue("total", out var totalObj) ? totalObj : null);
         var paid = ToDouble(totals.TryGetValue("paid", out var paidObj) ? paidObj : null);
         var due = ToDouble(totals.TryGetValue("balance", out var balanceObj) ? balanceObj : null);
+        var lineWidth = GetTicketLineWidth(template.ReceiptWidthMm);
 
         var sb = new StringBuilder();
-        sb.AppendLine(title);
+        foreach (var line in WrapTicketText(title, lineWidth))
+        {
+            sb.AppendLine(CenterTicketText(line, lineWidth));
+        }
         if (!string.IsNullOrWhiteSpace(template.BusinessTagline))
         {
-            sb.AppendLine(template.BusinessTagline);
+            foreach (var line in WrapTicketText(template.BusinessTagline, lineWidth))
+            {
+                sb.AppendLine(CenterTicketText(line, lineWidth));
+            }
         }
         if (!string.IsNullOrWhiteSpace(template.BusinessAddress))
         {
-            sb.AppendLine(template.BusinessAddress);
+            AppendTicketWrappedLine(sb, string.Empty, template.BusinessAddress, lineWidth);
         }
         if (!string.IsNullOrWhiteSpace(template.BusinessPhone))
         {
-            sb.AppendLine($"{(isArabic ? "هاتف" : "Phone")}: {template.BusinessPhone}");
+            AppendTicketWrappedLine(
+                sb,
+                $"{(isArabic ? "هاتف" : "Phone")}: ",
+                template.BusinessPhone,
+                lineWidth);
         }
         if (!string.IsNullOrWhiteSpace(template.BusinessTaxNumber))
         {
-            sb.AppendLine($"{(isArabic ? "رقم ضريبي" : "Tax ID")}: {template.BusinessTaxNumber}");
+            AppendTicketWrappedLine(
+                sb,
+                $"{(isArabic ? "رقم ضريبي" : "Tax ID")}: ",
+                template.BusinessTaxNumber,
+                lineWidth);
         }
         if (!string.IsNullOrWhiteSpace(template.HeaderNote))
         {
-            sb.AppendLine(template.HeaderNote);
+            AppendTicketWrappedLine(sb, string.Empty, template.HeaderNote, lineWidth);
         }
-        sb.AppendLine(new string('-', Paper80LineWidth));
-        sb.AppendLine($"{receiptLabel} #{order.OrderNo:00}");
-        sb.AppendLine($"{tableLabel}: {tableValue}");
+        sb.AppendLine(new string('-', lineWidth));
+        AppendTicketWrappedLine(sb, string.Empty, $"{receiptLabel} #{order.OrderNo:00}", lineWidth);
+        AppendTicketWrappedLine(sb, $"{tableLabel}: ", tableValue, lineWidth);
         if (order.PeopleCount.HasValue)
         {
-            sb.AppendLine($"{peopleLabel}: {order.PeopleCount}");
+            sb.AppendLine(BuildTicketPairLine(peopleLabel, order.PeopleCount.Value.ToString(), lineWidth));
         }
-        sb.AppendLine($"{timeLabel}: {order.CreatedAt:yyyy-MM-dd HH:mm:ss}");
-        sb.AppendLine(new string('-', Paper80LineWidth));
+        sb.AppendLine(BuildTicketPairLine(timeLabel, order.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss"), lineWidth));
+        sb.AppendLine(new string('-', lineWidth));
 
         foreach (var item in items)
         {
@@ -1191,39 +1222,39 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
                 ? gross * ((double)item.DiscountPercent / 100d)
                 : (double)item.DiscountAmount;
             var net = Math.Max(0, gross - disc);
-            sb.AppendLine(item.Name);
-            sb.AppendLine($"  {qty:0.###} x {unit:0.##} = {net:0.##}");
+            AppendTicketWrappedLine(sb, string.Empty, item.Name, lineWidth);
+            sb.AppendLine(BuildTicketPairLine($"  {qty:0.###} x {unit:0.##}", $"{net:0.##}", lineWidth));
             if (disc > 0)
             {
-                sb.AppendLine($"  {(isArabic ? "خصم" : "Discount")}: -{disc:0.##}");
+                sb.AppendLine(BuildTicketPairLine($"  {(isArabic ? "خصم" : "Discount")}", $"-{disc:0.##}", lineWidth));
             }
         }
 
-        sb.AppendLine(new string('-', Paper80LineWidth));
-        sb.AppendLine($"{subtotalLabel}: {subtotal:0.##}");
-        sb.AppendLine($"{discountLabel}: {itemDiscountTotal:0.##}");
-        sb.AppendLine($"{serviceLabel}: {serviceFee:0.##}");
-        sb.AppendLine($"{totalLabel}: {total:0.##}");
-        sb.AppendLine($"{paidLabel}: {paid:0.##}");
-        sb.AppendLine($"{dueLabel}: {due:0.##}");
+        sb.AppendLine(new string('-', lineWidth));
+        sb.AppendLine(BuildTicketPairLine(subtotalLabel, $"{subtotal:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(discountLabel, $"{itemDiscountTotal:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(serviceLabel, $"{serviceFee:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(totalLabel, $"{total:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(paidLabel, $"{paid:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(dueLabel, $"{due:0.##}", lineWidth));
         if (template.ShowPaymentsSection && payments.Count > 0)
         {
-            sb.AppendLine(new string('-', Paper80LineWidth));
+            sb.AppendLine(new string('-', lineWidth));
             sb.AppendLine(paymentLabel);
             foreach (var pay in payments)
             {
-                sb.AppendLine($"{pay.Method}: {(double)pay.Amount:0.##}");
+                sb.AppendLine(BuildTicketPairLine(pay.Method, $"{(double)pay.Amount:0.##}", lineWidth));
             }
         }
         if (!string.IsNullOrWhiteSpace(template.FooterNote))
         {
-            sb.AppendLine(new string('-', Paper80LineWidth));
-            sb.AppendLine(template.FooterNote);
+            sb.AppendLine(new string('-', lineWidth));
+            AppendTicketWrappedLine(sb, string.Empty, template.FooterNote, lineWidth);
         }
         sb.AppendLine();
         sb.AppendLine();
 
-        return WrapEscPosText(sb.ToString());
+        return WrapEscPosText(sb.ToString(), preferArabic: isArabic);
     }
 
     private async Task<byte[]> BuildInvoiceTicketBytes(Guid orderId, string? language, CancellationToken ct)
@@ -1282,38 +1313,53 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         var total = ToDouble(totals.TryGetValue("total", out var totalObj) ? totalObj : null);
         var paid = ToDouble(totals.TryGetValue("paid", out var paidObj) ? paidObj : null);
         var balance = ToDouble(totals.TryGetValue("balance", out var balanceObj) ? balanceObj : null);
+        var lineWidth = GetTicketLineWidth(template.InvoiceWidthMm);
 
         var sb = new StringBuilder();
-        sb.AppendLine(template.BusinessName);
+        foreach (var line in WrapTicketText(template.BusinessName, lineWidth))
+        {
+            sb.AppendLine(CenterTicketText(line, lineWidth));
+        }
         if (!string.IsNullOrWhiteSpace(template.BusinessTagline))
         {
-            sb.AppendLine(template.BusinessTagline);
+            foreach (var line in WrapTicketText(template.BusinessTagline, lineWidth))
+            {
+                sb.AppendLine(CenterTicketText(line, lineWidth));
+            }
         }
         if (!string.IsNullOrWhiteSpace(template.BusinessAddress))
         {
-            sb.AppendLine(template.BusinessAddress);
+            AppendTicketWrappedLine(sb, string.Empty, template.BusinessAddress, lineWidth);
         }
         if (!string.IsNullOrWhiteSpace(template.BusinessPhone))
         {
-            sb.AppendLine($"{(isArabic ? "هاتف" : "Phone")}: {template.BusinessPhone}");
+            AppendTicketWrappedLine(
+                sb,
+                $"{(isArabic ? "هاتف" : "Phone")}: ",
+                template.BusinessPhone,
+                lineWidth);
         }
         if (!string.IsNullOrWhiteSpace(template.BusinessTaxNumber))
         {
-            sb.AppendLine($"{(isArabic ? "رقم ضريبي" : "Tax ID")}: {template.BusinessTaxNumber}");
+            AppendTicketWrappedLine(
+                sb,
+                $"{(isArabic ? "رقم ضريبي" : "Tax ID")}: ",
+                template.BusinessTaxNumber,
+                lineWidth);
         }
         if (!string.IsNullOrWhiteSpace(template.HeaderNote))
         {
-            sb.AppendLine(template.HeaderNote);
+            AppendTicketWrappedLine(sb, string.Empty, template.HeaderNote, lineWidth);
         }
-        sb.AppendLine(new string('-', Paper80LineWidth));
-        sb.AppendLine($"{title} #{order.OrderNo:00}");
-        sb.AppendLine($"{tableLabel}: {tableValue}");
+        sb.AppendLine(new string('-', lineWidth));
+        AppendTicketWrappedLine(sb, string.Empty, $"{title} #{order.OrderNo:00}", lineWidth);
+        AppendTicketWrappedLine(sb, $"{tableLabel}: ", tableValue, lineWidth);
         if (order.PeopleCount.HasValue)
         {
-            sb.AppendLine($"{peopleLabel}: {order.PeopleCount}");
+            sb.AppendLine(BuildTicketPairLine(peopleLabel, order.PeopleCount.Value.ToString(), lineWidth));
         }
-        sb.AppendLine($"{timeLabel}: {order.CreatedAt:yyyy-MM-dd HH:mm:ss}");
-        sb.AppendLine(new string('-', Paper80LineWidth));
+        sb.AppendLine(BuildTicketPairLine(timeLabel, order.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss"), lineWidth));
+        sb.AppendLine(new string('-', lineWidth));
 
         foreach (var item in items)
         {
@@ -1324,30 +1370,30 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
                 ? gross * ((double)item.DiscountPercent / 100d)
                 : (double)item.DiscountAmount;
             var net = Math.Max(0, gross - disc);
-            sb.AppendLine(item.Name);
-            sb.AppendLine($"  {qty:0.###} x {unit:0.##} = {net:0.##}");
+            AppendTicketWrappedLine(sb, string.Empty, item.Name, lineWidth);
+            sb.AppendLine(BuildTicketPairLine($"  {qty:0.###} x {unit:0.##}", $"{net:0.##}", lineWidth));
             if (disc > 0)
             {
-                sb.AppendLine($"  {(isArabic ? "خصم" : "Discount")}: -{disc:0.##}");
+                sb.AppendLine(BuildTicketPairLine($"  {(isArabic ? "خصم" : "Discount")}", $"-{disc:0.##}", lineWidth));
             }
         }
 
-        sb.AppendLine(new string('-', Paper80LineWidth));
-        sb.AppendLine($"{subtotalLabel}: {subtotal:0.##}");
-        sb.AppendLine($"{discountLabel}: {itemDiscountTotal:0.##}");
-        sb.AppendLine($"{serviceLabel}: {serviceFee:0.##}");
-        sb.AppendLine($"{totalLabel}: {total:0.##}");
-        sb.AppendLine($"{paidLabel}: {paid:0.##}");
-        sb.AppendLine($"{balanceLabel}: {balance:0.##}");
+        sb.AppendLine(new string('-', lineWidth));
+        sb.AppendLine(BuildTicketPairLine(subtotalLabel, $"{subtotal:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(discountLabel, $"{itemDiscountTotal:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(serviceLabel, $"{serviceFee:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(totalLabel, $"{total:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(paidLabel, $"{paid:0.##}", lineWidth));
+        sb.AppendLine(BuildTicketPairLine(balanceLabel, $"{balance:0.##}", lineWidth));
         if (!string.IsNullOrWhiteSpace(template.FooterNote))
         {
-            sb.AppendLine(new string('-', Paper80LineWidth));
-            sb.AppendLine(template.FooterNote);
+            sb.AppendLine(new string('-', lineWidth));
+            AppendTicketWrappedLine(sb, string.Empty, template.FooterNote, lineWidth);
         }
         sb.AppendLine();
         sb.AppendLine();
 
-        return WrapEscPosText(sb.ToString());
+        return WrapEscPosText(sb.ToString(), preferArabic: isArabic);
     }
 
     private async Task<KitchenTicketTemplateSettings> LoadKitchenTicketTemplateSettings(CancellationToken ct)
@@ -1445,7 +1491,9 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         InvoiceTitleAr: "فاتورة",
         ReceiptTitleEn: "Receipt",
         ReceiptTitleAr: "إيصال",
-        ShowPaymentsSection: true);
+        ShowPaymentsSection: true,
+        InvoiceWidthMm: 80,
+        ReceiptWidthMm: 148);
 
     private static InvoiceTemplateSettings NormalizeInvoiceTemplate(InvoiceTemplatePayload? payload)
     {
@@ -1467,7 +1515,9 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             InvoiceTitleAr: NormalizeRequiredText(payload.InvoiceTitleAr, defaults.InvoiceTitleAr),
             ReceiptTitleEn: NormalizeRequiredText(payload.ReceiptTitleEn, defaults.ReceiptTitleEn),
             ReceiptTitleAr: NormalizeRequiredText(payload.ReceiptTitleAr, defaults.ReceiptTitleAr),
-            ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection);
+            ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection,
+            InvoiceWidthMm: NormalizePaperWidthMm(payload.InvoiceWidthMm, defaults.InvoiceWidthMm),
+            ReceiptWidthMm: NormalizePaperWidthMm(payload.ReceiptWidthMm, defaults.ReceiptWidthMm));
     }
 
     private static string NormalizeRequiredText(string? raw, string fallback)
@@ -1611,12 +1661,12 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         => !string.IsNullOrWhiteSpace(language) &&
            language.Trim().StartsWith("ar", StringComparison.OrdinalIgnoreCase);
 
-    private static void AppendTicketItemLine(StringBuilder sb, string itemText, string qtyText)
+    private static void AppendTicketItemLine(StringBuilder sb, string itemText, string qtyText, int lineWidth = Paper80LineWidth)
     {
         var cleanQty = NormalizeTicketInline(qtyText);
         var leftWidth = string.IsNullOrWhiteSpace(cleanQty)
-            ? Paper80LineWidth
-            : Math.Max(8, Paper80LineWidth - cleanQty.Length - 1);
+            ? lineWidth
+            : Math.Max(8, lineWidth - cleanQty.Length - 1);
         var wrapped = WrapTicketText(itemText, leftWidth);
         if (wrapped.Count == 0)
         {
@@ -1629,7 +1679,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         }
         else
         {
-            sb.AppendLine(BuildTicketPairLine(wrapped[0], cleanQty));
+            sb.AppendLine(BuildTicketPairLine(wrapped[0], cleanQty, lineWidth));
         }
 
         for (var i = 1; i < wrapped.Count; i += 1)
@@ -1638,10 +1688,10 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         }
     }
 
-    private static void AppendTicketWrappedLine(StringBuilder sb, string prefix, string value)
+    private static void AppendTicketWrappedLine(StringBuilder sb, string prefix, string value, int lineWidth = Paper80LineWidth)
     {
         var cleanPrefix = NormalizeTicketInline(prefix);
-        var wrapWidth = Math.Max(8, Paper80LineWidth - cleanPrefix.Length);
+        var wrapWidth = Math.Max(8, lineWidth - cleanPrefix.Length);
         var wrapped = WrapTicketText(value, wrapWidth);
         if (wrapped.Count == 0)
         {
@@ -1656,7 +1706,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         }
     }
 
-    private static string BuildTicketPairLine(string left, string right)
+    private static string BuildTicketPairLine(string left, string right, int lineWidth = Paper80LineWidth)
     {
         var cleanLeft = NormalizeTicketInline(left);
         var cleanRight = NormalizeTicketInline(right);
@@ -1665,12 +1715,12 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             return cleanLeft;
         }
 
-        if (cleanRight.Length >= Paper80LineWidth)
+        if (cleanRight.Length >= lineWidth)
         {
-            cleanRight = cleanRight[(cleanRight.Length - (Paper80LineWidth - 1))..];
+            cleanRight = cleanRight[(cleanRight.Length - (lineWidth - 1))..];
         }
 
-        var leftWidth = Math.Max(0, Paper80LineWidth - cleanRight.Length - 1);
+        var leftWidth = Math.Max(0, lineWidth - cleanRight.Length - 1);
         if (cleanLeft.Length > leftWidth)
         {
             cleanLeft = cleanLeft[..leftWidth];
@@ -1679,7 +1729,7 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         return $"{cleanLeft.PadRight(leftWidth)} {cleanRight}";
     }
 
-    private static string CenterTicketText(string value)
+    private static string CenterTicketText(string value, int lineWidth = Paper80LineWidth)
     {
         var clean = NormalizeTicketInline(value);
         if (string.IsNullOrWhiteSpace(clean))
@@ -1687,12 +1737,12 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             return string.Empty;
         }
 
-        if (clean.Length >= Paper80LineWidth)
+        if (clean.Length >= lineWidth)
         {
-            return clean[..Paper80LineWidth];
+            return clean[..lineWidth];
         }
 
-        var leftPadding = (Paper80LineWidth - clean.Length) / 2;
+        var leftPadding = (lineWidth - clean.Length) / 2;
         return $"{new string(' ', leftPadding)}{clean}";
     }
 
@@ -1751,13 +1801,22 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             .Trim();
     }
 
-    private static byte[] WrapEscPosText(string text)
+    private static byte[] WrapEscPosText(string text, bool preferArabic = false)
     {
-        var body = Encoding.UTF8.GetBytes(text);
+        var bodyText = text.Replace("\r\n", "\n");
+        var useArabicCodePage = preferArabic || ContainsArabic(bodyText);
+        var body = useArabicCodePage
+            ? ArabicEscPosEncoding.GetBytes(bodyText)
+            : Encoding.UTF8.GetBytes(bodyText);
         var bytes = new List<byte>(body.Length + 6)
         {
             0x1B, 0x40, // initialize
         };
+        if (useArabicCodePage)
+        {
+            // Most Arabic-capable ESC/POS printers expect Windows-1256 rather than UTF-8.
+            bytes.AddRange(new byte[] { 0x1B, 0x74, EscPosCodePageWindows1256 });
+        }
         bytes.AddRange(body);
         bytes.Add(0x0A);
         bytes.Add(0x0A);
@@ -1765,6 +1824,58 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         bytes.Add(0x56);
         bytes.Add(0x00); // cut
         return bytes.ToArray();
+    }
+
+    private static bool ContainsArabic(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        foreach (var ch in text)
+        {
+            if ((ch >= '\u0600' && ch <= '\u06FF') ||
+                (ch >= '\u0750' && ch <= '\u077F') ||
+                (ch >= '\u08A0' && ch <= '\u08FF') ||
+                (ch >= '\uFB50' && ch <= '\uFDFF') ||
+                (ch >= '\uFE70' && ch <= '\uFEFF'))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int GetTicketLineWidth(double paperWidthMm)
+    {
+        var normalizedWidth = NormalizePaperWidthMm(paperWidthMm, 80d);
+        return Math.Max(24, (int)Math.Round((normalizedWidth / 80d) * Paper80LineWidth, MidpointRounding.AwayFromZero));
+    }
+
+    private static double NormalizePaperWidthMm(double? raw, double fallback)
+    {
+        if (!raw.HasValue || double.IsNaN(raw.Value) || double.IsInfinity(raw.Value))
+        {
+            return fallback;
+        }
+
+        var target = raw.Value;
+        var closest = SupportedPaperWidthsMm[0];
+        var smallestDelta = Math.Abs(target - closest);
+        for (var i = 1; i < SupportedPaperWidthsMm.Length; i += 1)
+        {
+            var candidate = SupportedPaperWidthsMm[i];
+            var delta = Math.Abs(target - candidate);
+            if (delta < smallestDelta)
+            {
+                smallestDelta = delta;
+                closest = candidate;
+            }
+        }
+
+        return closest;
     }
 
     private static async Task SendToNetworkPrinter(string address, byte[] payload, CancellationToken ct)

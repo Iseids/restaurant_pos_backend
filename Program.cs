@@ -1345,6 +1345,8 @@ app.MapPut("/api/admin/settings/invoice-template", async (HttpContext ctx, HttpR
         GetString(payload, "layoutVariant"),
         GetBool(payload, "showLogo"),
         GetBool(payload, "showPaymentsSection"),
+        GetDouble(payload, "invoiceWidthMm"),
+        GetDouble(payload, "receiptWidthMm"),
         ct);
     return ApiResults.Ok(new { item });
 });
