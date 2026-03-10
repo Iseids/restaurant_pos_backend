@@ -23,7 +23,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         string? BusinessTagline,
         string? BusinessAddress,
         string? BusinessPhone,
+        string? BusinessPhoneAlt,
         string? BusinessTaxNumber,
+        string? LogoUrl,
         string? HeaderNote,
         string? FooterNote,
         string InvoiceTitleEn,
@@ -60,7 +62,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         public string? BusinessTagline { get; set; }
         public string? BusinessAddress { get; set; }
         public string? BusinessPhone { get; set; }
+        public string? BusinessPhoneAlt { get; set; }
         public string? BusinessTaxNumber { get; set; }
+        public string? LogoUrl { get; set; }
         public string? HeaderNote { get; set; }
         public string? FooterNote { get; set; }
         public string? InvoiceTitleEn { get; set; }
@@ -350,7 +354,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         string? businessTagline,
         string? businessAddress,
         string? businessPhone,
+        string? businessPhoneAlt,
         string? businessTaxNumber,
+        string? logoUrl,
         string? headerNote,
         string? footerNote,
         string? invoiceTitleEn,
@@ -372,7 +378,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             BusinessTagline = businessTagline,
             BusinessAddress = businessAddress,
             BusinessPhone = businessPhone,
+            BusinessPhoneAlt = businessPhoneAlt,
             BusinessTaxNumber = businessTaxNumber,
+            LogoUrl = logoUrl,
             HeaderNote = headerNote,
             FooterNote = footerNote,
             InvoiceTitleEn = invoiceTitleEn,
@@ -397,7 +405,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
                     BusinessTagline = snapshot.BusinessTagline,
                     BusinessAddress = snapshot.BusinessAddress,
                     BusinessPhone = snapshot.BusinessPhone,
+                    BusinessPhoneAlt = snapshot.BusinessPhoneAlt,
                     BusinessTaxNumber = snapshot.BusinessTaxNumber,
+                    LogoUrl = snapshot.LogoUrl,
                     HeaderNote = snapshot.HeaderNote,
                     FooterNote = snapshot.FooterNote,
                     InvoiceTitleEn = snapshot.InvoiceTitleEn,
@@ -1462,7 +1472,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             businessTagline = snapshot.BusinessTagline,
             businessAddress = snapshot.BusinessAddress,
             businessPhone = snapshot.BusinessPhone,
+            businessPhoneAlt = snapshot.BusinessPhoneAlt,
             businessTaxNumber = snapshot.BusinessTaxNumber,
+            logoUrl = snapshot.LogoUrl,
             headerNote = snapshot.HeaderNote,
             footerNote = snapshot.FooterNote,
             invoiceTitleEn = snapshot.InvoiceTitleEn,
@@ -1484,7 +1496,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         BusinessTagline: "Fresh food and fast service",
         BusinessAddress: null,
         BusinessPhone: null,
+        BusinessPhoneAlt: null,
         BusinessTaxNumber: null,
+        LogoUrl: null,
         HeaderNote: null,
         FooterNote: "Thank you for your visit",
         InvoiceTitleEn: "Invoice",
@@ -1512,7 +1526,9 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             BusinessTagline: NormalizeOptionalText(payload.BusinessTagline),
             BusinessAddress: NormalizeOptionalText(payload.BusinessAddress),
             BusinessPhone: NormalizeOptionalText(payload.BusinessPhone),
+            BusinessPhoneAlt: NormalizeOptionalText(payload.BusinessPhoneAlt),
             BusinessTaxNumber: NormalizeOptionalText(payload.BusinessTaxNumber),
+            LogoUrl: NormalizeOptionalText(payload.LogoUrl),
             HeaderNote: NormalizeOptionalText(payload.HeaderNote),
             FooterNote: NormalizeOptionalText(payload.FooterNote),
             InvoiceTitleEn: NormalizeRequiredText(payload.InvoiceTitleEn, defaults.InvoiceTitleEn),

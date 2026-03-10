@@ -588,7 +588,7 @@ app.MapPost("/api/orders/{id:guid}/send", async (HttpContext ctx, HttpRequest re
     }
 });
 
-app.MapPost("/api/orders/{id:guid}/payments", async (HttpContext ctx, HttpRequest req, Guid id, OrdersService orders, PrintService printService, CancellationToken ct) =>
+app.MapPost("/api/orders/{id:guid}/payments", async (HttpContext ctx, HttpRequest req, Guid id, OrdersService orders, CancellationToken ct) =>
 {
     if (ctx.RequireMinRole(PosRole.Cashier, out var user) is { } denied)
     {
@@ -599,9 +599,6 @@ app.MapPost("/api/orders/{id:guid}/payments", async (HttpContext ctx, HttpReques
     var method = GetString(payload, "method")?.Trim() ?? string.Empty;
     var amount = GetDouble(payload, "amount");
     var reference = GetString(payload, "reference")?.Trim();
-    var receiptPrinterId = GetGuid(payload, "receiptPrinterId");
-    var invoicePrinterId = GetGuid(payload, "invoicePrinterId");
-    var language = GetString(payload, "language")?.Trim();
 
     if (string.IsNullOrWhiteSpace(method) || !amount.HasValue)
     {
@@ -611,28 +608,6 @@ app.MapPost("/api/orders/{id:guid}/payments", async (HttpContext ctx, HttpReques
     try
     {
         var totals = await orders.AddPayment(id, user!.Id, method, amount.Value, reference, ct);
-
-        var balance = totals.TryGetValue("balance", out var balanceObj) ? Convert.ToDouble(balanceObj) : 1;
-        if (balance <= 0.0001)
-        {
-            try
-            {
-                await printService.PrintReceipt(id, receiptPrinterId, language, ct);
-            }
-            catch
-            {
-                // Ignore receipt print failures to preserve payment success semantics.
-            }
-
-            try
-            {
-                await printService.PrintInvoice(id, invoicePrinterId, language, ct);
-            }
-            catch
-            {
-                // Ignore invoice print failures to preserve payment success semantics.
-            }
-        }
 
         return ApiResults.Ok(new { totals });
     }
@@ -1333,7 +1308,9 @@ app.MapPut("/api/admin/settings/invoice-template", async (HttpContext ctx, HttpR
         GetString(payload, "businessTagline"),
         GetString(payload, "businessAddress"),
         GetString(payload, "businessPhone"),
+        GetString(payload, "businessPhoneAlt"),
         GetString(payload, "businessTaxNumber"),
+        GetString(payload, "logoUrl"),
         GetString(payload, "headerNote"),
         GetString(payload, "footerNote"),
         GetString(payload, "invoiceTitleEn"),
