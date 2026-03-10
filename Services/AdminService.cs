@@ -38,7 +38,11 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         bool ShowLogo,
         bool ShowPaymentsSection,
         double InvoiceWidthMm,
-        double ReceiptWidthMm);
+        double ReceiptWidthMm,
+        double InvoiceFontSize,
+        double ReceiptFontSize,
+        string InvoiceFontWeight,
+        string ReceiptFontWeight);
 
     private sealed record KitchenTicketTemplateSettingsSnapshot(
         string KitchenOrderTitleEn,
@@ -78,6 +82,10 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         public bool? ShowPaymentsSection { get; set; }
         public double? InvoiceWidthMm { get; set; }
         public double? ReceiptWidthMm { get; set; }
+        public double? InvoiceFontSize { get; set; }
+        public double? ReceiptFontSize { get; set; }
+        public string? InvoiceFontWeight { get; set; }
+        public string? ReceiptFontWeight { get; set; }
     }
 
     private sealed class KitchenTicketTemplatePayload
@@ -370,6 +378,10 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         bool? showPaymentsSection,
         double? invoiceWidthMm,
         double? receiptWidthMm,
+        double? invoiceFontSize,
+        double? receiptFontSize,
+        string? invoiceFontWeight,
+        string? receiptFontWeight,
         CancellationToken ct)
     {
         var snapshot = NormalizeInvoiceTemplate(new InvoiceTemplatePayload
@@ -394,6 +406,10 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             ShowPaymentsSection = showPaymentsSection,
             InvoiceWidthMm = invoiceWidthMm,
             ReceiptWidthMm = receiptWidthMm,
+            InvoiceFontSize = invoiceFontSize,
+            ReceiptFontSize = receiptFontSize,
+            InvoiceFontWeight = invoiceFontWeight,
+            ReceiptFontWeight = receiptFontWeight,
         });
 
         await UpsertSetting(
@@ -421,6 +437,10 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
                     ShowPaymentsSection = snapshot.ShowPaymentsSection,
                     InvoiceWidthMm = snapshot.InvoiceWidthMm,
                     ReceiptWidthMm = snapshot.ReceiptWidthMm,
+                    InvoiceFontSize = snapshot.InvoiceFontSize,
+                    ReceiptFontSize = snapshot.ReceiptFontSize,
+                    InvoiceFontWeight = snapshot.InvoiceFontWeight,
+                    ReceiptFontWeight = snapshot.ReceiptFontWeight,
                 },
                 JsonOptions),
             ct);
@@ -1488,6 +1508,10 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             showPaymentsSection = snapshot.ShowPaymentsSection,
             invoiceWidthMm = snapshot.InvoiceWidthMm,
             receiptWidthMm = snapshot.ReceiptWidthMm,
+            invoiceFontSize = snapshot.InvoiceFontSize,
+            receiptFontSize = snapshot.ReceiptFontSize,
+            invoiceFontWeight = snapshot.InvoiceFontWeight,
+            receiptFontWeight = snapshot.ReceiptFontWeight,
         };
     }
 
@@ -1511,7 +1535,11 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         ShowLogo: true,
         ShowPaymentsSection: true,
         InvoiceWidthMm: 80,
-        ReceiptWidthMm: 148);
+        ReceiptWidthMm: 148,
+        InvoiceFontSize: 10,
+        ReceiptFontSize: 10,
+        InvoiceFontWeight: "default",
+        ReceiptFontWeight: "default");
 
     private static InvoiceTemplateSettingsSnapshot NormalizeInvoiceTemplate(InvoiceTemplatePayload? payload)
     {
@@ -1541,7 +1569,11 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
             ShowLogo: payload.ShowLogo ?? defaults.ShowLogo,
             ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection,
             InvoiceWidthMm: NormalizePaperWidthMm(payload.InvoiceWidthMm, defaults.InvoiceWidthMm),
-            ReceiptWidthMm: NormalizePaperWidthMm(payload.ReceiptWidthMm, defaults.ReceiptWidthMm));
+            ReceiptWidthMm: NormalizePaperWidthMm(payload.ReceiptWidthMm, defaults.ReceiptWidthMm),
+            InvoiceFontSize: NormalizeTemplateFontSize(payload.InvoiceFontSize, defaults.InvoiceFontSize),
+            ReceiptFontSize: NormalizeTemplateFontSize(payload.ReceiptFontSize, defaults.ReceiptFontSize),
+            InvoiceFontWeight: NormalizeTemplateFontWeight(payload.InvoiceFontWeight, defaults.InvoiceFontWeight),
+            ReceiptFontWeight: NormalizeTemplateFontWeight(payload.ReceiptFontWeight, defaults.ReceiptFontWeight));
     }
 
     private static readonly double[] SupportedPaperWidthsMm = [58d, 60d, 70d, 72d, 80d, 112d, 148d];
@@ -1568,6 +1600,32 @@ public sealed class AdminService(PosDbContext db, IHttpClientFactory httpClientF
         }
 
         return closest;
+    }
+
+    private static double NormalizeTemplateFontSize(double? raw, double fallback)
+    {
+        if (!raw.HasValue || double.IsNaN(raw.Value) || double.IsInfinity(raw.Value))
+        {
+            return fallback;
+        }
+
+        return Math.Clamp(raw.Value, 8d, 18d);
+    }
+
+    private static string NormalizeTemplateFontWeight(string? raw, string fallback)
+    {
+        var value = raw?.Trim().ToLowerInvariant();
+        return value switch
+        {
+            "default" => "default",
+            "normal" => "regular",
+            "regular" => "regular",
+            "medium" => "medium",
+            "semibold" => "semibold",
+            "bold" => "bold",
+            "black" => "black",
+            _ => fallback,
+        };
     }
 
     private async Task<KitchenTicketTemplateSettingsSnapshot> LoadKitchenTicketTemplateSettings(CancellationToken ct)

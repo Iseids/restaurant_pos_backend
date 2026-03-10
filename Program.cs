@@ -1324,6 +1324,10 @@ app.MapPut("/api/admin/settings/invoice-template", async (HttpContext ctx, HttpR
         GetBool(payload, "showPaymentsSection"),
         GetDouble(payload, "invoiceWidthMm"),
         GetDouble(payload, "receiptWidthMm"),
+        GetDouble(payload, "invoiceFontSize"),
+        GetDouble(payload, "receiptFontSize"),
+        GetString(payload, "invoiceFontWeight"),
+        GetString(payload, "receiptFontWeight"),
         ct);
     return ApiResults.Ok(new { item });
 });

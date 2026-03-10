@@ -30,7 +30,11 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         string ReceiptTitleAr,
         bool ShowPaymentsSection,
         double InvoiceWidthMm,
-        double ReceiptWidthMm);
+        double ReceiptWidthMm,
+        double InvoiceFontSize,
+        double ReceiptFontSize,
+        string InvoiceFontWeight,
+        string ReceiptFontWeight);
     private sealed record KitchenTicketTemplateSettings(
         string KitchenOrderTitleEn,
         string KitchenOrderTitleAr,
@@ -55,6 +59,10 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         public bool? ShowPaymentsSection { get; set; }
         public double? InvoiceWidthMm { get; set; }
         public double? ReceiptWidthMm { get; set; }
+        public double? InvoiceFontSize { get; set; }
+        public double? ReceiptFontSize { get; set; }
+        public string? InvoiceFontWeight { get; set; }
+        public string? ReceiptFontWeight { get; set; }
     }
 
     private sealed class KitchenTicketTemplatePayload
@@ -512,7 +520,11 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             lines.Add(template.FooterNote!);
         }
 
-        return SimplePdfBuilder.BuildSinglePageText(lines, $"{template.BusinessName} - {template.InvoiceTitleEn}");
+        return SimplePdfBuilder.BuildSinglePageText(
+            lines,
+            $"{template.BusinessName} - {template.InvoiceTitleEn}",
+            template.InvoiceFontSize,
+            IsBoldLikeFontWeight(template.InvoiceFontWeight));
     }
 
     public Task PrintReceipt(Guid orderId, Guid? printerId, CancellationToken ct)
@@ -1493,7 +1505,11 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         ReceiptTitleAr: "إيصال",
         ShowPaymentsSection: true,
         InvoiceWidthMm: 80,
-        ReceiptWidthMm: 148);
+        ReceiptWidthMm: 148,
+        InvoiceFontSize: 10,
+        ReceiptFontSize: 10,
+        InvoiceFontWeight: "default",
+        ReceiptFontWeight: "default");
 
     private static InvoiceTemplateSettings NormalizeInvoiceTemplate(InvoiceTemplatePayload? payload)
     {
@@ -1517,7 +1533,11 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
             ReceiptTitleAr: NormalizeRequiredText(payload.ReceiptTitleAr, defaults.ReceiptTitleAr),
             ShowPaymentsSection: payload.ShowPaymentsSection ?? defaults.ShowPaymentsSection,
             InvoiceWidthMm: NormalizePaperWidthMm(payload.InvoiceWidthMm, defaults.InvoiceWidthMm),
-            ReceiptWidthMm: NormalizePaperWidthMm(payload.ReceiptWidthMm, defaults.ReceiptWidthMm));
+            ReceiptWidthMm: NormalizePaperWidthMm(payload.ReceiptWidthMm, defaults.ReceiptWidthMm),
+            InvoiceFontSize: NormalizeTemplateFontSize(payload.InvoiceFontSize, defaults.InvoiceFontSize),
+            ReceiptFontSize: NormalizeTemplateFontSize(payload.ReceiptFontSize, defaults.ReceiptFontSize),
+            InvoiceFontWeight: NormalizeTemplateFontWeight(payload.InvoiceFontWeight, defaults.InvoiceFontWeight),
+            ReceiptFontWeight: NormalizeTemplateFontWeight(payload.ReceiptFontWeight, defaults.ReceiptFontWeight));
     }
 
     private static string NormalizeRequiredText(string? raw, string fallback)
@@ -1876,6 +1896,38 @@ public sealed class PrintService(PosDbContext db, OrdersService orders)
         }
 
         return closest;
+    }
+
+    private static double NormalizeTemplateFontSize(double? raw, double fallback)
+    {
+        if (!raw.HasValue || double.IsNaN(raw.Value) || double.IsInfinity(raw.Value))
+        {
+            return fallback;
+        }
+
+        return Math.Clamp(raw.Value, 8d, 18d);
+    }
+
+    private static string NormalizeTemplateFontWeight(string? raw, string fallback)
+    {
+        var value = raw?.Trim().ToLowerInvariant();
+        return value switch
+        {
+            "default" => "default",
+            "normal" => "regular",
+            "regular" => "regular",
+            "medium" => "medium",
+            "semibold" => "semibold",
+            "bold" => "bold",
+            "black" => "black",
+            _ => fallback,
+        };
+    }
+
+    private static bool IsBoldLikeFontWeight(string? raw)
+    {
+        var value = raw?.Trim().ToLowerInvariant();
+        return value is "semibold" or "bold" or "black";
     }
 
     private static async Task SendToNetworkPrinter(string address, byte[] payload, CancellationToken ct)

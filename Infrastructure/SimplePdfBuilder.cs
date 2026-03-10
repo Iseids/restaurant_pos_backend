@@ -5,17 +5,22 @@ namespace ResPosBackend.Infrastructure;
 
 public static class SimplePdfBuilder
 {
-    public static byte[] BuildSinglePageText(IReadOnlyList<string> lines, string title)
+    public static byte[] BuildSinglePageText(
+        IReadOnlyList<string> lines,
+        string title,
+        double fontSize = 11,
+        bool bold = false)
     {
         const double pageWidth = 595;
         const double pageHeight = 842;
         const double startX = 40;
         const double startY = 800;
-        const double lineStep = 15;
+        var normalizedFontSize = Math.Clamp(fontSize, 8d, 18d);
+        var lineStep = normalizedFontSize + 4d;
 
         var content = new StringBuilder();
         content.AppendLine("BT");
-        content.AppendLine("/F1 11 Tf");
+        content.AppendLine($"/F1 {Fmt(normalizedFontSize)} Tf");
         content.AppendLine($"{Fmt(startX)} {Fmt(startY)} Td");
 
         if (!string.IsNullOrWhiteSpace(title))
@@ -39,7 +44,7 @@ public static class SimplePdfBuilder
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             $"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {Fmt(pageWidth)} {Fmt(pageHeight)}] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
             $"<< /Length {streamBytes.Length} >>\nstream\n{Encoding.ASCII.GetString(streamBytes)}endstream",
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            $"<< /Type /Font /Subtype /Type1 /BaseFont /{(bold ? "Helvetica-Bold" : "Helvetica")} >>",
         };
 
         return Build(objects);
